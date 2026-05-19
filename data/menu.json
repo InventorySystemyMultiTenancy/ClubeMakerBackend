@@ -1,0 +1,32 @@
+[
+  {
+    "id": "prod_1",
+    "name": "Plano Mensal Clube",
+    "description": "Assinatura mensal para acesso aos beneficios do clube.",
+    "price": 49.9,
+    "category": "Planos",
+    "videoUrl": "",
+    "imageUrl": "https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?fit=crop&w=400&q=80",
+    "popular": true
+  },
+  {
+    "id": "prod_2",
+    "name": "Kit Boas-vindas",
+    "description": "Kit inicial para novos membros do clube.",
+    "price": 79.9,
+    "category": "Kits",
+    "videoUrl": "",
+    "imageUrl": "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?fit=crop&w=400&q=80",
+    "popular": true
+  },
+  {
+    "id": "prod_3",
+    "name": "Ingresso Evento",
+    "description": "Entrada para evento exclusivo do clube.",
+    "price": 35.0,
+    "category": "Eventos",
+    "videoUrl": "",
+    "imageUrl": "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?fit=crop&w=400&q=80",
+    "popular": false
+  }
+]
