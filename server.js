@@ -29,15 +29,24 @@ import superAdminRoutes from "./routes/superadmin.js";
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+const envFrontendOrigins = (process.env.FRONTEND_URL || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://clubsmaker.vercel.app",
+  "https://clubsmaker.com.br",
+  "https://app.clubsmaker.com.br",
+  "https://clubemaker.selfmachine.com.br",
+  ...envFrontendOrigins,
+];
+
 // Configuração CORS para permitir frontend local e produção
 app.use(
   cors({
-    origin: [
-      "http://localhost:3000",
-      "https://clubsmaker.vercel.app",
-      "https://clubsmaker.com.br",
-      "https://app.clubsmaker.com.br",
-    ],
+    origin: allowedOrigins,
     credentials: true,
   }),
 );
@@ -621,13 +630,6 @@ async function initDatabase() {
 // --- Middlewares ---
 
 // Permissões CORS para web e apps móveis (Capacitor)
-
-const allowedOrigins = [
-  "http://localhost:3000",
-  "https://clubsmaker.com.br",
-  "https://app.clubsmaker.com.br",
-  process.env.FRONTEND_URL,
-].filter(Boolean);
 
 app.use(
   cors({
