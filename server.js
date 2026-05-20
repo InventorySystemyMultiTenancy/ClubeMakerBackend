@@ -121,6 +121,28 @@ const dbConfig = process.env.DATABASE_URL
 
 const db = knex(dbConfig);
 
+const toOrderNumber = (value, fallback = null) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const getOrderItemPricingSnapshot = (item, product = null) => {
+  const price = toOrderNumber(item.price, 0);
+  const customUnitPrice = toOrderNumber(item.customUnitPrice, price);
+  const originalUnitPrice = toOrderNumber(
+    item.originalUnitPrice,
+    toOrderNumber(product?.compareAtPrice, customUnitPrice),
+  );
+  const discountPercent = toOrderNumber(item.discountPercent, 0);
+
+  return {
+    price,
+    originalUnitPrice,
+    customUnitPrice,
+    discountPercent,
+  };
+};
+
 const parseJSON = (data) => {
   if (typeof data === "string") {
     try {
@@ -472,6 +494,37 @@ async function initDatabase() {
     console.log("✅ Coluna 'hiddenAt' adicionada à tabela orders");
   }
 
+  const hasOrderProducts = await db.schema.hasTable("order_products");
+  if (!hasOrderProducts) {
+    await db.schema.createTable("order_products", (table) => {
+      table.increments("id").primary();
+      table.string("order_id").notNullable();
+      table.string("product_id").notNullable();
+      table.integer("quantity").notNullable().defaultTo(1);
+      table.decimal("price", 8, 2).notNullable().defaultTo(0);
+      table.decimal("originalUnitPrice", 8, 2);
+      table.decimal("customUnitPrice", 8, 2);
+      table.decimal("discountPercent", 5, 2).defaultTo(0);
+    });
+    console.log("Tabela order_products criada com sucesso");
+  } else {
+    const orderProductPricingCols = [
+      { name: "originalUnitPrice", precision: 8, scale: 2 },
+      { name: "customUnitPrice", precision: 8, scale: 2 },
+      { name: "discountPercent", precision: 5, scale: 2 },
+    ];
+
+    for (const col of orderProductPricingCols) {
+      const hasCol = await db.schema.hasColumn("order_products", col.name);
+      if (!hasCol) {
+        await db.schema.table("order_products", (table) => {
+          table.decimal(col.name, col.precision, col.scale);
+        });
+        console.log(`Coluna '${col.name}' adicionada a order_products`);
+      }
+    }
+  }
+
   const hasHiddenByColumn = await db.schema.hasColumn("orders", "hiddenBy");
   if (!hasHiddenByColumn) {
     await db.schema.table("orders", (table) => {
@@ -534,6 +587,9 @@ async function initDatabase() {
           name: product ? product.name : "-",
           price: op.price,
           quantity: op.quantity,
+          originalUnitPrice: op.originalUnitPrice,
+          customUnitPrice: op.customUnitPrice,
+          discountPercent: op.discountPercent,
         });
       }
       order.items = items;
@@ -2309,13 +2365,17 @@ app.post("/api/orders", async (req, res) => {
 
       // 3. Salva um snapshot do custo em cada item vendido
       const itemsWithPrecoBruto = Array.isArray(items)
-        ? items.map((item) => ({
-            ...item,
-            precoBruto:
-              item.precoBruto !== undefined
-                ? Number(item.precoBruto)
-                : Number(productsById.get(String(item.id))?.priceRaw) || 0,
-          }))
+        ? items.map((item) => {
+            const product = productsById.get(String(item.id));
+            return {
+              ...item,
+              ...getOrderItemPricingSnapshot(item, product),
+              precoBruto:
+                item.precoBruto !== undefined
+                  ? Number(item.precoBruto)
+                  : Number(product?.priceRaw) || 0,
+            };
+          })
         : [];
 
       const newOrder = {
@@ -2341,12 +2401,20 @@ app.post("/api/orders", async (req, res) => {
 
       // 5. Salva os itens do pedido na tabela order_products
       if (Array.isArray(items) && items.length > 0) {
-        const orderProducts = items.map((item) => ({
-          order_id: newOrder.id,
-          product_id: item.id,
-          quantity: item.quantity || 1,
-          price: item.price !== undefined ? item.price : 0,
-        }));
+        const orderProducts = items.map((item) => {
+          const product = productsById.get(String(item.id));
+          const pricing = getOrderItemPricingSnapshot(item, product);
+
+          return {
+            order_id: newOrder.id,
+            product_id: item.id,
+            quantity: item.quantity || 1,
+            price: pricing.price,
+            originalUnitPrice: pricing.originalUnitPrice,
+            customUnitPrice: pricing.customUnitPrice,
+            discountPercent: pricing.discountPercent,
+          };
+        });
         await trx("order_products").insert(orderProducts);
       }
 
@@ -2367,7 +2435,13 @@ app.get("/api/users/:userId/orders", async (req, res) => {
     const orders = await db("orders")
       .where({ userId })
       .orderBy("timestamp", "desc");
-    res.json(orders);
+    res.json(
+      orders.map((order) => ({
+        ...order,
+        items: parseJSON(order.items),
+        total: parseFloat(order.total),
+      })),
+    );
   } catch (e) {
     console.error("❌ Erro ao buscar pedidos do usuário:", e);
     res.status(500).json({ error: "Erro ao buscar pedidos do usuário" });
