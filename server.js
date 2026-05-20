@@ -319,7 +319,7 @@ async function initDatabase() {
       table.string("id").primary();
       table.string("name").notNullable();
       table.decimal("price", 8, 2).notNullable();
-      table.decimal("priceRaw", 8, 2).notNullable().defaultTo(0); // Preço bruto
+      table.decimal("priceRaw", 8, 2).notNullable().defaultTo(0); // Custo unitario
       table.string("category").notNullable();
       table.string("videoUrl");
       table.string("imageUrl"); // URL da imagem do produto
@@ -1131,6 +1131,7 @@ app.get(
           .replace(/\s+/g, " ")
           .trim();
       let totalRevenue = 0;
+      let totalCost = 0;
       let totalItemsSold = 0;
 
       const calculatePeriodDays = () => {
@@ -1162,6 +1163,10 @@ app.get(
       const periodDays = calculatePeriodDays();
 
       const getUnitCostByItem = (item) => {
+        const snapshotCost = Number(item.precoBruto ?? item.priceRaw);
+        if (Number.isFinite(snapshotCost) && snapshotCost > 0) {
+          return snapshotCost;
+        }
         const prodId = item.productId || item.id;
         if (!prodId) return 0;
         const meta = productMetaMap.get(String(prodId));
@@ -1263,9 +1268,11 @@ app.get(
           const unitCost = getUnitCostByItem(item);
 
           const itemRevenue = salePrice * quantity;
-          const itemValueToReceive = (salePrice - unitCost) * quantity;
+          const itemCost = unitCost * quantity;
+          const itemProfit = itemRevenue - itemCost;
 
           totalItemsSold += quantity;
+          totalCost += itemCost;
 
           const existing = productSales.get(itemId) || {
             productId: itemId,
@@ -1273,14 +1280,16 @@ app.get(
             category: itemCategory,
             quantitySold: 0,
             revenue: 0,
-            giraKidsValue: 0,
+            cost: 0,
+            netProfit: 0,
             stock: itemMeta?.stock ?? null,
             minStock: itemMeta?.minStock || 0,
           };
 
           existing.quantitySold += quantity;
           existing.revenue += itemRevenue;
-          existing.giraKidsValue += itemValueToReceive;
+          existing.cost += itemCost;
+          existing.netProfit += itemProfit;
 
           productSales.set(itemId, existing);
 
@@ -1325,6 +1334,7 @@ app.get(
       const averageTicket = successfulOrdersCount
         ? totalRevenue / successfulOrdersCount
         : 0;
+      const netProfit = totalRevenue - totalCost;
       const successRate = ordersInRange.length
         ? (successfulOrdersCount / ordersInRange.length) * 100
         : 0;
@@ -1342,7 +1352,8 @@ app.get(
         .map((product) => ({
           ...product,
           revenue: Number(product.revenue.toFixed(2)),
-          giraKidsValue: Number(product.giraKidsValue.toFixed(2)),
+          cost: Number(product.cost.toFixed(2)),
+          netProfit: Number(product.netProfit.toFixed(2)),
           stock:
             product.stock === null || product.stock === undefined
               ? null
@@ -1541,6 +1552,8 @@ app.get(
           pendingOrders: pendingOrdersCount,
           totalItemsSold,
           totalRevenue: Number(totalRevenue.toFixed(2)),
+          totalCost: Number(totalCost.toFixed(2)),
+          netProfit: Number(netProfit.toFixed(2)),
           averageTicket: Number(averageTicket.toFixed(2)),
           successRate: Number(successRate.toFixed(2)),
           cancellationRate: Number(cancellationRate.toFixed(2)),
@@ -2242,12 +2255,14 @@ app.post("/api/orders", async (req, res) => {
         });
       }
 
-      // 2. Checagem de estoque
+      // 2. Checagem de estoque e captura do custo atual do produto
+      const productsById = new Map();
       for (const item of items) {
         const product = await trx("products").where({ id: item.id }).first();
         if (!product) {
           throw new Error(`Produto ${item.id} não encontrado no estoque!`);
         }
+        productsById.set(String(item.id), product);
         if (product.stock !== null && product.stock < item.quantity) {
           throw new Error(
             `Estoque insuficiente para ${item.name}. Disponível: ${product.stock}, Solicitado: ${item.quantity}`,
@@ -2255,12 +2270,14 @@ app.post("/api/orders", async (req, res) => {
         }
       }
 
-      // 3. Garante precoBruto em todos os itens
+      // 3. Salva um snapshot do custo em cada item vendido
       const itemsWithPrecoBruto = Array.isArray(items)
         ? items.map((item) => ({
             ...item,
             precoBruto:
-              item.precoBruto !== undefined ? Number(item.precoBruto) : 0,
+              item.precoBruto !== undefined
+                ? Number(item.precoBruto)
+                : Number(productsById.get(String(item.id))?.priceRaw) || 0,
           }))
         : [];
 
@@ -5449,3 +5466,4 @@ Promise.all([initDatabase(), initRedis()])
     console.error("❌ ERRO FATAL ao iniciar servidor:", err);
     process.exit(1);
   });
+
