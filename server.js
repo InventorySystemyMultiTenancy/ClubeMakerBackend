@@ -2386,10 +2386,14 @@ app.delete("/api/users/:userId/orders/:orderId", async (req, res) => {
       return res.status(404).json({ error: "Pedido nao encontrado" });
     }
 
-    if (order.paymentStatus !== "pending" || order.status === "active") {
+    if (
+      order.paymentStatus !== "pending" ||
+      order.status === "active" ||
+      order.paymentType === "presencial"
+    ) {
       return res.status(400).json({
         error:
-          "Apenas pedidos pendentes que ainda nao foram confirmados podem ser excluidos pelo cliente",
+          "Apenas pedidos pendentes que ainda nao foram confirmados para pagamento presencial podem ser excluidos pelo cliente",
       });
     }
 
