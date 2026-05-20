@@ -319,6 +319,7 @@ async function initDatabase() {
       table.string("id").primary();
       table.string("name").notNullable();
       table.decimal("price", 8, 2).notNullable();
+      table.decimal("compareAtPrice", 8, 2);
       table.decimal("priceRaw", 8, 2).notNullable().defaultTo(0); // Custo unitario
       table.string("category").notNullable();
       table.string("videoUrl");
@@ -361,6 +362,16 @@ async function initDatabase() {
       console.log("✅ Coluna priceRaw adicionada");
     }
     // Adiciona coluna minStock se não existir
+    const hasCompareAtPrice = await db.schema.hasColumn(
+      "products",
+      "compareAtPrice",
+    );
+    if (!hasCompareAtPrice) {
+      await db.schema.table("products", (table) => {
+        table.decimal("compareAtPrice", 8, 2);
+      });
+      console.log("Coluna compareAtPrice adicionada");
+    }
     const hasMinStock = await db.schema.hasColumn("products", "minStock");
     if (!hasMinStock) {
       await db.schema.table("products", (table) => {
@@ -764,6 +775,10 @@ app.get("/api/menu", async (req, res) => {
         return {
           ...p,
           price: parseFloat(p.price),
+          compareAtPrice:
+            p.compareAtPrice !== undefined && p.compareAtPrice !== null
+              ? parseFloat(p.compareAtPrice)
+              : null,
           priceRaw: p.priceRaw !== undefined ? parseFloat(p.priceRaw) : 0,
           imageUrl: normalizedImages[0] || p.imageUrl || null,
           images: normalizedImages,
@@ -1617,6 +1632,12 @@ app.get(
 
           return {
             ...p,
+            price: p.price !== undefined ? parseFloat(p.price) : 0,
+            compareAtPrice:
+              p.compareAtPrice !== undefined && p.compareAtPrice !== null
+                ? parseFloat(p.compareAtPrice)
+                : null,
+            priceRaw: p.priceRaw !== undefined ? parseFloat(p.priceRaw) : 0,
             imageUrl: normalizedImages[0] || p.imageUrl || null,
             images: normalizedImages,
           };
@@ -1638,6 +1659,7 @@ app.post(
       id,
       name,
       price,
+      compareAtPrice,
       priceRaw,
       category,
       imageUrl,
@@ -1667,6 +1689,10 @@ app.post(
         id: id || `prod_${Date.now()}`,
         name,
         price: parseFloat(price),
+        compareAtPrice:
+          compareAtPrice !== undefined && compareAtPrice !== null && compareAtPrice !== ""
+            ? parseFloat(compareAtPrice)
+            : null,
         priceRaw: priceRaw !== undefined ? parseFloat(priceRaw) : 0,
         category,
         imageUrl: primaryImage,
@@ -1705,6 +1731,7 @@ app.put(
     const {
       name,
       price,
+      compareAtPrice,
       priceRaw,
       category,
       imageUrl,
@@ -1728,6 +1755,12 @@ app.put(
       const updates = {};
       if (name !== undefined) updates.name = name;
       if (price !== undefined) updates.price = parseFloat(price);
+      if (compareAtPrice !== undefined) {
+        updates.compareAtPrice =
+          compareAtPrice !== null && compareAtPrice !== ""
+            ? parseFloat(compareAtPrice)
+            : null;
+      }
       if (priceRaw !== undefined) updates.priceRaw = parseFloat(priceRaw);
       if (category !== undefined) updates.category = category;
       if (imageUrl !== undefined) {
@@ -1783,6 +1816,10 @@ app.put(
           return updated.imageUrl ? [updated.imageUrl] : [];
         })(),
         price: parseFloat(updated.price),
+        compareAtPrice:
+          updated.compareAtPrice !== undefined && updated.compareAtPrice !== null
+            ? parseFloat(updated.compareAtPrice)
+            : null,
         isAvailable: updated.stock === null || updated.stock > 0,
       });
     } catch (e) {
