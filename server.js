@@ -2337,6 +2337,85 @@ app.get("/api/users/:userId/orders", async (req, res) => {
   }
 });
 
+app.put(
+  "/api/users/:userId/orders/:orderId/confirm-presencial",
+  async (req, res) => {
+    try {
+      const { userId, orderId } = req.params;
+      const order = await db("orders").where({ id: orderId, userId }).first();
+
+      if (!order) {
+        return res.status(404).json({ error: "Pedido nao encontrado" });
+      }
+
+      if (order.paymentStatus !== "pending") {
+        return res.status(400).json({
+          error:
+            "Apenas pedidos pendentes podem ser confirmados para pagamento presencial",
+        });
+      }
+
+      await db("orders").where({ id: orderId, userId }).update({
+        status: "active",
+        paymentType: "presencial",
+        paymentMethod: "presencial",
+        paymentStatus: "pending",
+      });
+
+      const updated = await db("orders").where({ id: orderId, userId }).first();
+      return res.json({
+        ...updated,
+        items: parseJSON(updated.items),
+        total: parseFloat(updated.total),
+      });
+    } catch (e) {
+      console.error("Erro ao confirmar pedido presencial:", e);
+      return res
+        .status(500)
+        .json({ error: "Erro ao confirmar pedido presencial" });
+    }
+  },
+);
+
+app.delete("/api/users/:userId/orders/:orderId", async (req, res) => {
+  try {
+    const { userId, orderId } = req.params;
+    const order = await db("orders").where({ id: orderId, userId }).first();
+
+    if (!order) {
+      return res.status(404).json({ error: "Pedido nao encontrado" });
+    }
+
+    if (order.paymentStatus !== "pending") {
+      return res.status(400).json({
+        error: "Apenas pedidos pendentes podem ser excluidos pelo cliente",
+      });
+    }
+
+    const items = parseJSON(order.items);
+    for (const item of Array.isArray(items) ? items : []) {
+      const product = await db("products").where({ id: item.id }).first();
+      if (product && product.stock !== null && product.stock_reserved > 0) {
+        await db("products")
+          .where({ id: item.id })
+          .update({
+            stock_reserved: Math.max(
+              0,
+              Number(product.stock_reserved || 0) - Number(item.quantity || 0),
+            ),
+          });
+      }
+    }
+
+    await db("order_products").where({ order_id: orderId }).del();
+    await db("orders").where({ id: orderId, userId }).del();
+
+    return res.json({ ok: true, orderId });
+  } catch (e) {
+    console.error("Erro ao excluir pedido do cliente:", e);
+    return res.status(500).json({ error: "Erro ao excluir pedido" });
+  }
+});
 // Atualizar pedido (adicionar paymentId após pagamento aprovado)
 // Endpoint para marcar pedido como pago (presencial)
 app.put("/api/orders/:id/mark-paid", async (req, res) => {
@@ -5466,4 +5545,5 @@ Promise.all([initDatabase(), initRedis()])
     console.error("❌ ERRO FATAL ao iniciar servidor:", err);
     process.exit(1);
   });
+
 
