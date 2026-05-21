@@ -502,6 +502,7 @@ async function initDatabase() {
       table.string("product_id").notNullable();
       table.integer("quantity").notNullable().defaultTo(1);
       table.decimal("price", 8, 2).notNullable().defaultTo(0);
+      table.string("product_name");
       table.decimal("originalUnitPrice", 8, 2);
       table.decimal("customUnitPrice", 8, 2);
       table.decimal("discountPercent", 5, 2).defaultTo(0);
@@ -509,6 +510,7 @@ async function initDatabase() {
     console.log("Tabela order_products criada com sucesso");
   } else {
     const orderProductPricingCols = [
+      { name: "product_name", type: "string" },
       { name: "originalUnitPrice", precision: 8, scale: 2 },
       { name: "customUnitPrice", precision: 8, scale: 2 },
       { name: "discountPercent", precision: 5, scale: 2 },
@@ -518,11 +520,41 @@ async function initDatabase() {
       const hasCol = await db.schema.hasColumn("order_products", col.name);
       if (!hasCol) {
         await db.schema.table("order_products", (table) => {
-          table.decimal(col.name, col.precision, col.scale);
+          if (col.type === "string") {
+            table.string(col.name);
+          } else {
+            table.decimal(col.name, col.precision, col.scale);
+          }
         });
         console.log(`Coluna '${col.name}' adicionada a order_products`);
       }
     }
+  }
+
+  if (!(await db.schema.hasTable("project_quotes"))) {
+    await db.schema.createTable("project_quotes", (table) => {
+      table.string("id").primary();
+      table.string("userId").notNullable();
+      table.string("userName");
+      table.string("fileName").notNullable();
+      table.integer("fileSize").defaultTo(0);
+      table.string("size").notNullable();
+      table.string("height").notNullable();
+      table.string("width").notNullable();
+      table.string("depth").notNullable();
+      table.string("colorQuantity").notNullable();
+      table.text("colors").notNullable();
+      table.string("pieceQuantity").notNullable();
+      table.text("shippingData").notNullable();
+      table.string("status").defaultTo("pending");
+      table.decimal("quotedTotal", 10, 2);
+      table.text("adminObservation");
+      table.string("deliveryDeadline");
+      table.string("orderId");
+      table.string("createdAt").notNullable();
+      table.string("updatedAt");
+    });
+    console.log("Tabela project_quotes criada com sucesso");
   }
 
   const hasHiddenByColumn = await db.schema.hasColumn("orders", "hiddenBy");
@@ -584,7 +616,7 @@ async function initDatabase() {
           .first();
         items.push({
           id: op.product_id,
-          name: product ? product.name : "-",
+          name: product ? product.name : op.product_name || "-",
           price: op.price,
           quantity: op.quantity,
           originalUnitPrice: op.originalUnitPrice,
@@ -898,6 +930,230 @@ const authorizeKitchen = (req, res, next) => {
 // Relatório de gestão para admin (usa a mesma base de cálculo do superadmin)
 
 // Histórico de movimentações de estoque (backend)
+const normalizeProjectQuote = (quote) => ({
+  ...quote,
+  quotedTotal:
+    quote.quotedTotal !== undefined && quote.quotedTotal !== null
+      ? parseFloat(quote.quotedTotal)
+      : null,
+  fileSize: Number(quote.fileSize) || 0,
+});
+
+app.post("/api/project-quotes", async (req, res) => {
+  try {
+    const {
+      userId,
+      userName,
+      fileName,
+      fileSize,
+      size,
+      height,
+      width,
+      depth,
+      colorQuantity,
+      colors,
+      pieceQuantity,
+      shippingData,
+    } = req.body;
+
+    if (
+      !userId ||
+      !fileName ||
+      !size ||
+      !height ||
+      !width ||
+      !depth ||
+      !colorQuantity ||
+      !colors ||
+      !pieceQuantity ||
+      !shippingData
+    ) {
+      return res.status(400).json({ error: "Campos obrigatorios ausentes" });
+    }
+
+    const quote = {
+      id: `quote_${Date.now()}`,
+      userId,
+      userName: userName || "Cliente",
+      fileName,
+      fileSize: Number(fileSize) || 0,
+      size,
+      height,
+      width,
+      depth,
+      colorQuantity,
+      colors,
+      pieceQuantity,
+      shippingData,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    await db("project_quotes").insert(quote);
+    res.status(201).json(normalizeProjectQuote(quote));
+  } catch (e) {
+    console.error("Erro ao criar orcamento:", e);
+    res.status(500).json({ error: "Erro ao criar orcamento" });
+  }
+});
+
+app.get("/api/users/:userId/project-quotes", async (req, res) => {
+  try {
+    const quotes = await db("project_quotes")
+      .where({ userId: req.params.userId })
+      .orderBy("createdAt", "desc");
+    res.json(quotes.map(normalizeProjectQuote));
+  } catch (e) {
+    console.error("Erro ao buscar orcamentos do cliente:", e);
+    res.status(500).json({ error: "Erro ao buscar orcamentos" });
+  }
+});
+
+app.get(
+  "/api/admin/project-quotes",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const quotes = await db("project_quotes").orderBy("createdAt", "desc");
+      res.json(quotes.map(normalizeProjectQuote));
+    } catch (e) {
+      console.error("Erro ao buscar orcamentos admin:", e);
+      res.status(500).json({ error: "Erro ao buscar orcamentos" });
+    }
+  },
+);
+
+app.put(
+  "/api/admin/project-quotes/:id",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { quotedTotal, adminObservation, deliveryDeadline } = req.body;
+      const quote = await db("project_quotes").where({ id: req.params.id }).first();
+
+      if (!quote) {
+        return res.status(404).json({ error: "Orcamento nao encontrado" });
+      }
+
+      const total = Number(quotedTotal);
+      if (!Number.isFinite(total) || total <= 0 || !deliveryDeadline) {
+        return res.status(400).json({
+          error: "Informe valor do orcamento e prazo de entrega",
+        });
+      }
+
+      await db("project_quotes")
+        .where({ id: quote.id })
+        .update({
+          quotedTotal: total,
+          adminObservation: adminObservation || null,
+          deliveryDeadline,
+          status: "sent",
+          updatedAt: new Date().toISOString(),
+        });
+
+      const updated = await db("project_quotes").where({ id: quote.id }).first();
+      res.json(normalizeProjectQuote(updated));
+    } catch (e) {
+      console.error("Erro ao responder orcamento:", e);
+      res.status(500).json({ error: "Erro ao responder orcamento" });
+    }
+  },
+);
+
+app.put("/api/project-quotes/:id/respond", async (req, res) => {
+  try {
+    const { approved, userId } = req.body;
+    const quote = await db("project_quotes").where({ id: req.params.id }).first();
+
+    if (!quote || (userId && quote.userId !== userId)) {
+      return res.status(404).json({ error: "Orcamento nao encontrado" });
+    }
+
+    if (quote.status !== "sent") {
+      return res.status(400).json({
+        error: "Apenas orcamentos enviados pelo admin podem ser respondidos",
+      });
+    }
+
+    if (!approved) {
+      await db("project_quotes")
+        .where({ id: quote.id })
+        .update({ status: "rejected", updatedAt: new Date().toISOString() });
+      const rejected = await db("project_quotes").where({ id: quote.id }).first();
+      return res.json(normalizeProjectQuote(rejected));
+    }
+
+    const total = Number(quote.quotedTotal) || 0;
+    const orderItem = {
+      id: quote.id,
+      productId: quote.id,
+      name: `Projeto 3D - ${quote.fileName}`,
+      quantity: 1,
+      price: total,
+      originalUnitPrice: total,
+      customUnitPrice: total,
+      discountPercent: 0,
+      category: "Projeto 3D",
+    };
+
+    const order = {
+      id: `order_${Date.now()}`,
+      userId: quote.userId,
+      userName: quote.userName || "Cliente",
+      total,
+      timestamp: new Date().toISOString(),
+      status: "pending",
+      paymentStatus: "pending",
+      paymentId: null,
+      paymentType: "orcamento",
+      paymentMethod: null,
+      items: JSON.stringify([orderItem]),
+      observation: [
+        quote.adminObservation ? `Obs. admin: ${quote.adminObservation}` : null,
+        quote.deliveryDeadline ? `Prazo: ${quote.deliveryDeadline}` : null,
+        `Dados de envio: ${quote.shippingData}`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      created_at: new Date(),
+    };
+
+    await db.transaction(async (trx) => {
+      await trx("orders").insert(order);
+      await trx("order_products").insert({
+        order_id: order.id,
+        product_id: quote.id,
+        product_name: orderItem.name,
+        quantity: 1,
+        price: total,
+        originalUnitPrice: total,
+        customUnitPrice: total,
+        discountPercent: 0,
+      });
+      await trx("project_quotes")
+        .where({ id: quote.id })
+        .update({
+          status: "approved",
+          orderId: order.id,
+          updatedAt: new Date().toISOString(),
+        });
+    });
+
+    const updated = await db("project_quotes").where({ id: quote.id }).first();
+    res.json({
+      quote: normalizeProjectQuote(updated),
+      order: { ...order, items: [orderItem] },
+    });
+  } catch (e) {
+    console.error("Erro ao responder orcamento:", e);
+    res.status(500).json({ error: "Erro ao responder orcamento" });
+  }
+});
+
 app.get(
   "/api/admin/stock-movements",
   authenticateToken,
@@ -2408,6 +2664,7 @@ app.post("/api/orders", async (req, res) => {
           return {
             order_id: newOrder.id,
             product_id: item.id,
+            product_name: item.name,
             quantity: item.quantity || 1,
             price: pricing.price,
             originalUnitPrice: pricing.originalUnitPrice,
