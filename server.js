@@ -120,6 +120,7 @@ const dbConfig = process.env.DATABASE_URL
     };
 
 const db = knex(dbConfig);
+const projectUploadDir = path.join(process.cwd(), "data", "project-uploads");
 
 const toOrderNumber = (value, fallback = null) => {
   const parsed = Number(value);
@@ -538,6 +539,7 @@ async function initDatabase() {
       table.string("userName");
       table.string("fileName").notNullable();
       table.integer("fileSize").defaultTo(0);
+      table.string("filePath");
       table.string("size").notNullable();
       table.string("height").notNullable();
       table.string("width").notNullable();
@@ -555,6 +557,28 @@ async function initDatabase() {
       table.string("updatedAt");
     });
     console.log("Tabela project_quotes criada com sucesso");
+  }
+  const hasProjectQuoteFilePath = await db.schema.hasColumn(
+    "project_quotes",
+    "filePath",
+  );
+  if (!hasProjectQuoteFilePath) {
+    await db.schema.table("project_quotes", (table) => {
+      table.string("filePath");
+    });
+    console.log("Coluna filePath adicionada a project_quotes");
+  }
+  if (!(await db.schema.hasTable("project_files"))) {
+    await db.schema.createTable("project_files", (table) => {
+      table.string("id").primary();
+      table.string("sourceQuoteId");
+      table.string("fileName").notNullable();
+      table.integer("fileSize").defaultTo(0);
+      table.string("filePath").notNullable();
+      table.text("note");
+      table.string("createdAt").notNullable();
+    });
+    console.log("Tabela project_files criada com sucesso");
   }
 
   const hasHiddenByColumn = await db.schema.hasColumn("orders", "hiddenBy");
@@ -746,7 +770,7 @@ app.use(
     credentials: true,
   }),
 );
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 // Endpoint para listar todos os produtos (admin)
 
@@ -932,11 +956,46 @@ const authorizeKitchen = (req, res, next) => {
 // Histórico de movimentações de estoque (backend)
 const normalizeProjectQuote = (quote) => ({
   ...quote,
+  filePath: undefined,
+  hasFile: !!quote.filePath,
   quotedTotal:
     quote.quotedTotal !== undefined && quote.quotedTotal !== null
       ? parseFloat(quote.quotedTotal)
       : null,
   fileSize: Number(quote.fileSize) || 0,
+});
+
+const sanitizeProjectFileName = (fileName = "arquivo") => {
+  const base = path.basename(String(fileName));
+  return base.replace(/[^\w.\-()\[\] ]+/g, "_").slice(0, 160) || "arquivo";
+};
+
+const saveProjectQuoteFile = async ({ quoteId, fileName, fileBase64 }) => {
+  if (!fileBase64) return null;
+
+  await fs.mkdir(projectUploadDir, { recursive: true });
+  const safeName = sanitizeProjectFileName(fileName);
+  const storedName = `${quoteId}_${safeName}`;
+  const filePath = path.join(projectUploadDir, storedName);
+  await fs.writeFile(filePath, Buffer.from(fileBase64, "base64"));
+  return filePath;
+};
+
+const projectLibraryDir = path.join(process.cwd(), "data", "project-library");
+
+const assertProjectFilePath = (filePath, rootDir) => {
+  const resolvedPath = path.resolve(filePath);
+  const resolvedRoot = path.resolve(rootDir);
+  if (!resolvedPath.startsWith(resolvedRoot)) {
+    throw new Error("Caminho de arquivo invalido");
+  }
+  return resolvedPath;
+};
+
+const normalizeProjectFile = (file) => ({
+  ...file,
+  filePath: undefined,
+  fileSize: Number(file.fileSize) || 0,
 });
 
 app.post("/api/project-quotes", async (req, res) => {
@@ -954,6 +1013,7 @@ app.post("/api/project-quotes", async (req, res) => {
       colors,
       pieceQuantity,
       shippingData,
+      fileBase64,
     } = req.body;
 
     if (
@@ -971,12 +1031,20 @@ app.post("/api/project-quotes", async (req, res) => {
       return res.status(400).json({ error: "Campos obrigatorios ausentes" });
     }
 
+    const quoteId = `quote_${Date.now()}`;
+    const filePath = await saveProjectQuoteFile({
+      quoteId,
+      fileName,
+      fileBase64,
+    });
+
     const quote = {
-      id: `quote_${Date.now()}`,
+      id: quoteId,
       userId,
       userName: userName || "Cliente",
       fileName,
       fileSize: Number(fileSize) || 0,
+      filePath,
       size,
       height,
       width,
@@ -1021,6 +1089,162 @@ app.get(
     } catch (e) {
       console.error("Erro ao buscar orcamentos admin:", e);
       res.status(500).json({ error: "Erro ao buscar orcamentos" });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/project-quotes/:id/download",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const quote = await db("project_quotes").where({ id: req.params.id }).first();
+
+      if (!quote || !quote.filePath) {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
+
+      const resolvedPath = assertProjectFilePath(quote.filePath, projectUploadDir);
+
+      await fs.access(resolvedPath);
+      res.download(resolvedPath, sanitizeProjectFileName(quote.fileName));
+    } catch (e) {
+      console.error("Erro ao baixar arquivo do orcamento:", e);
+      res.status(500).json({ error: "Erro ao baixar arquivo" });
+    }
+  },
+);
+
+app.post(
+  "/api/admin/project-quotes/:id/save-file",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { note } = req.body || {};
+      const quote = await db("project_quotes").where({ id: req.params.id }).first();
+
+      if (!quote || !quote.filePath) {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
+
+      const sourcePath = assertProjectFilePath(quote.filePath, projectUploadDir);
+      await fs.access(sourcePath);
+      await fs.mkdir(projectLibraryDir, { recursive: true });
+
+      const fileId = `project_file_${Date.now()}`;
+      const safeName = sanitizeProjectFileName(quote.fileName);
+      const libraryPath = path.join(projectLibraryDir, `${fileId}_${safeName}`);
+      await fs.copyFile(sourcePath, libraryPath);
+
+      const file = {
+        id: fileId,
+        sourceQuoteId: quote.id,
+        fileName: quote.fileName,
+        fileSize: Number(quote.fileSize) || 0,
+        filePath: libraryPath,
+        note: note || null,
+        createdAt: new Date().toISOString(),
+      };
+
+      await db("project_files").insert(file);
+      res.status(201).json(normalizeProjectFile(file));
+    } catch (e) {
+      console.error("Erro ao salvar arquivo na biblioteca:", e);
+      res.status(500).json({ error: "Erro ao salvar arquivo" });
+    }
+  },
+);
+
+app.delete(
+  "/api/admin/project-quotes/:id/file",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const quote = await db("project_quotes").where({ id: req.params.id }).first();
+
+      if (!quote || !quote.filePath) {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
+
+      const resolvedPath = assertProjectFilePath(quote.filePath, projectUploadDir);
+      await fs.unlink(resolvedPath).catch((err) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+      await db("project_quotes").where({ id: quote.id }).update({
+        filePath: null,
+        updatedAt: new Date().toISOString(),
+      });
+
+      res.json({ ok: true, quoteId: quote.id });
+    } catch (e) {
+      console.error("Erro ao excluir arquivo do orcamento:", e);
+      res.status(500).json({ error: "Erro ao excluir arquivo" });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/project-files",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const files = await db("project_files").orderBy("createdAt", "desc");
+      res.json(files.map(normalizeProjectFile));
+    } catch (e) {
+      console.error("Erro ao buscar biblioteca de arquivos:", e);
+      res.status(500).json({ error: "Erro ao buscar arquivos" });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/project-files/:id/download",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const file = await db("project_files").where({ id: req.params.id }).first();
+
+      if (!file || !file.filePath) {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
+
+      const resolvedPath = assertProjectFilePath(file.filePath, projectLibraryDir);
+      await fs.access(resolvedPath);
+      res.download(resolvedPath, sanitizeProjectFileName(file.fileName));
+    } catch (e) {
+      console.error("Erro ao baixar arquivo salvo:", e);
+      res.status(500).json({ error: "Erro ao baixar arquivo" });
+    }
+  },
+);
+
+app.delete(
+  "/api/admin/project-files/:id",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const file = await db("project_files").where({ id: req.params.id }).first();
+
+      if (!file) {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
+
+      const resolvedPath = assertProjectFilePath(file.filePath, projectLibraryDir);
+      await fs.unlink(resolvedPath).catch((err) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+      await db("project_files").where({ id: file.id }).del();
+
+      res.json({ ok: true, fileId: file.id });
+    } catch (e) {
+      console.error("Erro ao excluir arquivo salvo:", e);
+      res.status(500).json({ error: "Erro ao excluir arquivo" });
     }
   },
 );
