@@ -2666,6 +2666,47 @@ app.get("/api/users/cpf/:cpf", async (req, res) => {
   }
 });
 
+app.get("/api/admincustomer/customers", async (req, res) => {
+  try {
+    const { adminCustomerId } = req.query;
+
+    if (!adminCustomerId) {
+      return res.status(400).json({ error: "adminCustomerId obrigatorio" });
+    }
+
+    const requester = await db("users")
+      .where({ id: String(adminCustomerId) })
+      .first();
+
+    if (
+      !requester ||
+      (requester.role !== "admincustomer" && requester.role !== "admin")
+    ) {
+      return res.status(403).json({ error: "Acesso nao autorizado" });
+    }
+
+    const users = await db("users").select("*").orderBy("name", "asc");
+
+    res.json(
+      users
+        .filter((user) => (user.role || "customer") === "customer")
+        .map((user) => ({
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          cpf: user.cpf,
+          phone: user.phone,
+          telefone: user.telefone || user.phone,
+          role: user.role || "customer",
+          historico: [],
+        })),
+    );
+  } catch (e) {
+    console.error("Erro ao listar clientes para admincustomer:", e);
+    res.status(500).json({ error: "Erro ao buscar clientes" });
+  }
+});
+
 app.get("/api/users", authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const users = await db("users").select("*");
