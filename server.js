@@ -3228,7 +3228,7 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
 
 app.put("/api/orders/:id", async (req, res) => {
   const { id } = req.params;
-  let { paymentId, paymentStatus } = req.body;
+  let { paymentId, paymentStatus, items, total } = req.body;
   // Importa serviço de pagamento para validação
   const { checkPaymentStatus } = await import("./services/paymentService.js");
 
@@ -3260,6 +3260,89 @@ app.put("/api/orders/:id", async (req, res) => {
     const updates = {};
     if (paymentId !== undefined) updates.paymentId = paymentId;
     if (paymentStatus) updates.paymentStatus = paymentStatus;
+
+    if (items !== undefined) {
+      if (!Array.isArray(items) || items.length === 0) {
+        return res
+          .status(400)
+          .json({ error: "Pedido precisa ter pelo menos um item" });
+      }
+
+      const productsById = new Map();
+      for (const item of items) {
+        const productId = String(item.productId || item.id || "");
+        if (!productId) {
+          return res.status(400).json({ error: "Item sem produto" });
+        }
+
+        const product = await db("products").where({ id: productId }).first();
+        if (product) {
+          productsById.set(productId, product);
+        }
+      }
+
+      const normalizedItems = items.map((item) => {
+        const productId = String(item.productId || item.id);
+        const product = productsById.get(productId);
+        const quantity = Math.max(1, Number(item.quantity) || 1);
+        const price = Math.max(0, Number(item.price) || 0);
+        const pricing = getOrderItemPricingSnapshot(
+          {
+            ...item,
+            id: productId,
+            productId,
+            price,
+            quantity,
+            customUnitPrice:
+              item.customUnitPrice !== undefined
+                ? item.customUnitPrice
+                : price,
+          },
+          product,
+        );
+
+        return {
+          ...item,
+          id: productId,
+          productId,
+          name: item.name || product?.name || "Produto",
+          quantity,
+          price: pricing.price,
+          originalUnitPrice: pricing.originalUnitPrice,
+          customUnitPrice: pricing.customUnitPrice,
+          discountPercent: pricing.discountPercent,
+          precoBruto:
+            item.precoBruto !== undefined
+              ? Number(item.precoBruto)
+              : Number(product?.priceRaw) || 0,
+        };
+      });
+
+      const nextTotal =
+        total !== undefined
+          ? Math.max(0, Number(total) || 0)
+          : normalizedItems.reduce(
+              (sum, item) => sum + Number(item.price || 0) * item.quantity,
+              0,
+            );
+
+      updates.items = JSON.stringify(normalizedItems);
+      updates.total = Number(nextTotal.toFixed(2));
+
+      await db("order_products").where({ order_id: id }).del();
+      await db("order_products").insert(
+        normalizedItems.map((item) => ({
+          order_id: id,
+          product_id: item.productId || item.id,
+          product_name: item.name,
+          quantity: item.quantity,
+          price: item.price,
+          originalUnitPrice: item.originalUnitPrice,
+          customUnitPrice: item.customUnitPrice,
+          discountPercent: item.discountPercent,
+        })),
+      );
+    }
 
     // 🎯 Validação real do pagamento antes de liberar pedido
     let isPaymentApproved = false;
