@@ -980,13 +980,13 @@ const getProjectQuotesWithCustomerPhones = async (query) => {
   const quotes = await query;
   const userIds = [...new Set(quotes.map((quote) => quote.userId).filter(Boolean))];
   const users = userIds.length
-    ? await db("users").whereIn("id", userIds).select("id", "phone", "telefone")
+    ? await db("users").whereIn("id", userIds).select("id", "phone")
     : [];
   const usersById = new Map(users.map((user) => [String(user.id), user]));
 
   return quotes.map((quote) => {
     const user = usersById.get(String(quote.userId));
-    const customerPhone = user?.phone || user?.telefone || null;
+    const customerPhone = user?.phone || null;
     return normalizeProjectQuote({
       ...quote,
       customerPhone,
