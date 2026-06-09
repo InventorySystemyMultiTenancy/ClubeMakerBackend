@@ -897,7 +897,7 @@ app.get("/api/menu", async (req, res) => {
           stock: p.stock,
           stock_reserved: p.stock_reserved || 0,
           stock_available: stockAvailable,
-          isAvailable: stockAvailable === null || stockAvailable > 0,
+          isAvailable: true,
         };
       }),
     );
@@ -2358,7 +2358,7 @@ app.post(
       res.status(201).json({
         ...newProduct,
         images: parseJSON(newProduct.images),
-        isAvailable: newProduct.stock === null || newProduct.stock > 0,
+        isAvailable: true,
       });
     } catch (e) {
       console.error("Erro ao criar produto:", e);
@@ -2465,7 +2465,7 @@ app.put(
           updated.compareAtPrice !== undefined && updated.compareAtPrice !== null
             ? parseFloat(updated.compareAtPrice)
             : null,
-        isAvailable: updated.stock === null || updated.stock > 0,
+        isAvailable: true,
       });
     } catch (e) {
       console.error("Erro ao atualizar produto:", e);
@@ -2978,7 +2978,7 @@ app.post("/api/orders", async (req, res) => {
         });
       }
 
-      // 2. Checagem de estoque e captura do custo atual do produto
+      // 2. Captura do produto atual sem bloquear venda por estoque
       const productsById = new Map();
       for (const item of items) {
         const product = await trx("products").where({ id: item.id }).first();
@@ -2986,11 +2986,6 @@ app.post("/api/orders", async (req, res) => {
           throw new Error(`Produto ${item.id} não encontrado no estoque!`);
         }
         productsById.set(String(item.id), product);
-        if (product.stock !== null && product.stock < item.quantity) {
-          throw new Error(
-            `Estoque insuficiente para ${item.name}. Disponível: ${product.stock}, Solicitado: ${item.quantity}`,
-          );
-        }
       }
 
       // 3. Salva um snapshot do custo em cada item vendido
@@ -5112,11 +5107,7 @@ app.post("/api/ai/suggestion", async (req, res) => {
       "stock",
     );
 
-    const availableProducts = products.filter(
-      (p) => p.stock === null || p.stock > 0,
-    );
-
-    const productList = availableProducts
+    const productList = products
       .map(
         (p) =>
           `- ${p.name} (${p.category}) - R$ ${p.price} ${
