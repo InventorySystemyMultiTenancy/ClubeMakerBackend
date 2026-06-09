@@ -976,6 +976,25 @@ const normalizeProjectQuote = (quote) => ({
   fileSize: Number(quote.fileSize) || 0,
 });
 
+const getProjectQuotesWithCustomerPhones = async (query) => {
+  const quotes = await query;
+  const userIds = [...new Set(quotes.map((quote) => quote.userId).filter(Boolean))];
+  const users = userIds.length
+    ? await db("users").whereIn("id", userIds).select("id", "phone", "telefone")
+    : [];
+  const usersById = new Map(users.map((user) => [String(user.id), user]));
+
+  return quotes.map((quote) => {
+    const user = usersById.get(String(quote.userId));
+    const customerPhone = user?.phone || user?.telefone || null;
+    return normalizeProjectQuote({
+      ...quote,
+      customerPhone,
+      userPhone: customerPhone,
+    });
+  });
+};
+
 const sanitizeProjectFileName = (fileName = "arquivo") => {
   const base = path.basename(String(fileName));
   return base.replace(/[^\w.\-()\[\] ]+/g, "_").slice(0, 160) || "arquivo";
@@ -1094,10 +1113,12 @@ app.post("/api/project-quotes", async (req, res) => {
 
 app.get("/api/users/:userId/project-quotes", async (req, res) => {
   try {
-    const quotes = await db("project_quotes")
-      .where({ userId: req.params.userId })
-      .orderBy("createdAt", "desc");
-    res.json(quotes.map(normalizeProjectQuote));
+    const quotes = await getProjectQuotesWithCustomerPhones(
+      db("project_quotes")
+        .where({ userId: req.params.userId })
+        .orderBy("createdAt", "desc"),
+    );
+    res.json(quotes);
   } catch (e) {
     console.error("Erro ao buscar orcamentos do cliente:", e);
     res.status(500).json({ error: "Erro ao buscar orcamentos" });
@@ -1110,8 +1131,10 @@ app.get(
   authorizeAdmin,
   async (req, res) => {
     try {
-      const quotes = await db("project_quotes").orderBy("createdAt", "desc");
-      res.json(quotes.map(normalizeProjectQuote));
+      const quotes = await getProjectQuotesWithCustomerPhones(
+        db("project_quotes").orderBy("createdAt", "desc"),
+      );
+      res.json(quotes);
     } catch (e) {
       console.error("Erro ao buscar orcamentos admin:", e);
       res.status(500).json({ error: "Erro ao buscar orcamentos" });
