@@ -540,6 +540,7 @@ async function initDatabase() {
       table.string("fileName").notNullable();
       table.integer("fileSize").defaultTo(0);
       table.string("filePath");
+      table.text("projectLink");
       table.string("size").notNullable();
       table.string("height").notNullable();
       table.string("width").notNullable();
@@ -567,6 +568,16 @@ async function initDatabase() {
       table.string("filePath");
     });
     console.log("Coluna filePath adicionada a project_quotes");
+  }
+  const hasProjectQuoteProjectLink = await db.schema.hasColumn(
+    "project_quotes",
+    "projectLink",
+  );
+  if (!hasProjectQuoteProjectLink) {
+    await db.schema.table("project_quotes", (table) => {
+      table.text("projectLink");
+    });
+    console.log("Coluna projectLink adicionada a project_quotes");
   }
   if (!(await db.schema.hasTable("project_files"))) {
     await db.schema.createTable("project_files", (table) => {
@@ -1026,6 +1037,7 @@ app.post("/api/project-quotes", async (req, res) => {
       userName,
       fileName,
       fileSize,
+      projectLink,
       size,
       height,
       width,
@@ -1037,19 +1049,11 @@ app.post("/api/project-quotes", async (req, res) => {
       fileBase64,
     } = req.body;
 
-    if (
-      !userId ||
-      !fileName ||
-      !size ||
-      !height ||
-      !width ||
-      !depth ||
-      !colorQuantity ||
-      !colors ||
-      !pieceQuantity ||
-      !shippingData
-    ) {
-      return res.status(400).json({ error: "Campos obrigatorios ausentes" });
+    const hasFile = Boolean(fileName && fileBase64);
+    const hasProjectLink = Boolean(String(projectLink || "").trim());
+
+    if (!userId || (!hasFile && !hasProjectLink)) {
+      return res.status(400).json({ error: "Envie um arquivo ou informe o link do projeto" });
     }
 
     const quoteId = `quote_${Date.now()}`;
@@ -1063,17 +1067,18 @@ app.post("/api/project-quotes", async (req, res) => {
       id: quoteId,
       userId,
       userName: userName || "Cliente",
-      fileName,
+      fileName: fileName || "Link do projeto",
       fileSize: Number(fileSize) || 0,
       filePath,
-      size,
-      height,
-      width,
-      depth,
-      colorQuantity,
-      colors,
-      pieceQuantity,
-      shippingData,
+      projectLink: String(projectLink || "").trim() || null,
+      size: size || "",
+      height: height || "",
+      width: width || "",
+      depth: depth || "",
+      colorQuantity: colorQuantity || "",
+      colors: colors || "",
+      pieceQuantity: pieceQuantity || "",
+      shippingData: shippingData || "",
       status: "pending",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
