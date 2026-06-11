@@ -120,6 +120,29 @@ const dbConfig = process.env.DATABASE_URL
     };
 
 const db = knex(dbConfig);
+const projectUploadDir = path.join(process.cwd(), "data", "project-uploads");
+
+const toOrderNumber = (value, fallback = null) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const getOrderItemPricingSnapshot = (item, product = null) => {
+  const price = toOrderNumber(item.price, 0);
+  const customUnitPrice = toOrderNumber(item.customUnitPrice, price);
+  const originalUnitPrice = toOrderNumber(
+    item.originalUnitPrice,
+    toOrderNumber(product?.compareAtPrice, customUnitPrice),
+  );
+  const discountPercent = toOrderNumber(item.discountPercent, 0);
+
+  return {
+    price,
+    originalUnitPrice,
+    customUnitPrice,
+    discountPercent,
+  };
+};
 
 const parseJSON = (data) => {
   if (typeof data === "string") {
@@ -319,6 +342,7 @@ async function initDatabase() {
       table.string("id").primary();
       table.string("name").notNullable();
       table.decimal("price", 8, 2).notNullable();
+      table.decimal("compareAtPrice", 8, 2);
       table.decimal("priceRaw", 8, 2).notNullable().defaultTo(0); // Custo unitario
       table.string("category").notNullable();
       table.string("videoUrl");
@@ -361,6 +385,16 @@ async function initDatabase() {
       console.log("✅ Coluna priceRaw adicionada");
     }
     // Adiciona coluna minStock se não existir
+    const hasCompareAtPrice = await db.schema.hasColumn(
+      "products",
+      "compareAtPrice",
+    );
+    if (!hasCompareAtPrice) {
+      await db.schema.table("products", (table) => {
+        table.decimal("compareAtPrice", 8, 2);
+      });
+      console.log("Coluna compareAtPrice adicionada");
+    }
     const hasMinStock = await db.schema.hasColumn("products", "minStock");
     if (!hasMinStock) {
       await db.schema.table("products", (table) => {
@@ -461,6 +495,103 @@ async function initDatabase() {
     console.log("✅ Coluna 'hiddenAt' adicionada à tabela orders");
   }
 
+  const hasOrderProducts = await db.schema.hasTable("order_products");
+  if (!hasOrderProducts) {
+    await db.schema.createTable("order_products", (table) => {
+      table.increments("id").primary();
+      table.string("order_id").notNullable();
+      table.string("product_id").notNullable();
+      table.integer("quantity").notNullable().defaultTo(1);
+      table.decimal("price", 8, 2).notNullable().defaultTo(0);
+      table.string("product_name");
+      table.decimal("originalUnitPrice", 8, 2);
+      table.decimal("customUnitPrice", 8, 2);
+      table.decimal("discountPercent", 5, 2).defaultTo(0);
+    });
+    console.log("Tabela order_products criada com sucesso");
+  } else {
+    const orderProductPricingCols = [
+      { name: "product_name", type: "string" },
+      { name: "originalUnitPrice", precision: 8, scale: 2 },
+      { name: "customUnitPrice", precision: 8, scale: 2 },
+      { name: "discountPercent", precision: 5, scale: 2 },
+    ];
+
+    for (const col of orderProductPricingCols) {
+      const hasCol = await db.schema.hasColumn("order_products", col.name);
+      if (!hasCol) {
+        await db.schema.table("order_products", (table) => {
+          if (col.type === "string") {
+            table.string(col.name);
+          } else {
+            table.decimal(col.name, col.precision, col.scale);
+          }
+        });
+        console.log(`Coluna '${col.name}' adicionada a order_products`);
+      }
+    }
+  }
+
+  if (!(await db.schema.hasTable("project_quotes"))) {
+    await db.schema.createTable("project_quotes", (table) => {
+      table.string("id").primary();
+      table.string("userId").notNullable();
+      table.string("userName");
+      table.string("fileName").notNullable();
+      table.integer("fileSize").defaultTo(0);
+      table.string("filePath");
+      table.text("projectLink");
+      table.string("size").notNullable();
+      table.string("height").notNullable();
+      table.string("width").notNullable();
+      table.string("depth").notNullable();
+      table.string("colorQuantity").notNullable();
+      table.text("colors").notNullable();
+      table.string("pieceQuantity").notNullable();
+      table.text("shippingData").notNullable();
+      table.string("status").defaultTo("pending");
+      table.decimal("quotedTotal", 10, 2);
+      table.text("adminObservation");
+      table.string("deliveryDeadline");
+      table.string("orderId");
+      table.string("createdAt").notNullable();
+      table.string("updatedAt");
+    });
+    console.log("Tabela project_quotes criada com sucesso");
+  }
+  const hasProjectQuoteFilePath = await db.schema.hasColumn(
+    "project_quotes",
+    "filePath",
+  );
+  if (!hasProjectQuoteFilePath) {
+    await db.schema.table("project_quotes", (table) => {
+      table.string("filePath");
+    });
+    console.log("Coluna filePath adicionada a project_quotes");
+  }
+  const hasProjectQuoteProjectLink = await db.schema.hasColumn(
+    "project_quotes",
+    "projectLink",
+  );
+  if (!hasProjectQuoteProjectLink) {
+    await db.schema.table("project_quotes", (table) => {
+      table.text("projectLink");
+    });
+    console.log("Coluna projectLink adicionada a project_quotes");
+  }
+  if (!(await db.schema.hasTable("project_files"))) {
+    await db.schema.createTable("project_files", (table) => {
+      table.string("id").primary();
+      table.string("sourceQuoteId");
+      table.string("fileName").notNullable();
+      table.integer("fileSize").defaultTo(0);
+      table.string("filePath").notNullable();
+      table.text("note");
+      table.string("createdAt").notNullable();
+    });
+    console.log("Tabela project_files criada com sucesso");
+  }
+
   const hasHiddenByColumn = await db.schema.hasColumn("orders", "hiddenBy");
   if (!hasHiddenByColumn) {
     await db.schema.table("orders", (table) => {
@@ -520,9 +651,12 @@ async function initDatabase() {
           .first();
         items.push({
           id: op.product_id,
-          name: product ? product.name : "-",
+          name: product ? product.name : op.product_name || "-",
           price: op.price,
           quantity: op.quantity,
+          originalUnitPrice: op.originalUnitPrice,
+          customUnitPrice: op.customUnitPrice,
+          discountPercent: op.discountPercent,
         });
       }
       order.items = items;
@@ -647,7 +781,7 @@ app.use(
     credentials: true,
   }),
 );
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 // Endpoint para listar todos os produtos (admin)
 
@@ -764,13 +898,17 @@ app.get("/api/menu", async (req, res) => {
         return {
           ...p,
           price: parseFloat(p.price),
+          compareAtPrice:
+            p.compareAtPrice !== undefined && p.compareAtPrice !== null
+              ? parseFloat(p.compareAtPrice)
+              : null,
           priceRaw: p.priceRaw !== undefined ? parseFloat(p.priceRaw) : 0,
           imageUrl: normalizedImages[0] || p.imageUrl || null,
           images: normalizedImages,
           stock: p.stock,
           stock_reserved: p.stock_reserved || 0,
           stock_available: stockAvailable,
-          isAvailable: stockAvailable === null || stockAvailable > 0,
+          isAvailable: true,
         };
       }),
     );
@@ -827,6 +965,556 @@ const authorizeKitchen = (req, res, next) => {
 // Relatório de gestão para admin (usa a mesma base de cálculo do superadmin)
 
 // Histórico de movimentações de estoque (backend)
+const normalizeProjectQuote = (quote) => ({
+  ...quote,
+  filePath: undefined,
+  hasFile: !!quote.filePath,
+  quotedTotal:
+    quote.quotedTotal !== undefined && quote.quotedTotal !== null
+      ? parseFloat(quote.quotedTotal)
+      : null,
+  fileSize: Number(quote.fileSize) || 0,
+});
+
+const getProjectQuotesWithCustomerPhones = async (query) => {
+  const quotes = await query;
+  const userIds = [...new Set(quotes.map((quote) => quote.userId).filter(Boolean))];
+  const users = userIds.length
+    ? await db("users").whereIn("id", userIds).select("id", "phone")
+    : [];
+  const usersById = new Map(users.map((user) => [String(user.id), user]));
+
+  return quotes.map((quote) => {
+    const user = usersById.get(String(quote.userId));
+    const customerPhone = user?.phone || null;
+    return normalizeProjectQuote({
+      ...quote,
+      customerPhone,
+      userPhone: customerPhone,
+    });
+  });
+};
+
+const sanitizeProjectFileName = (fileName = "arquivo") => {
+  const base = path.basename(String(fileName));
+  return base.replace(/[^\w.\-()\[\] ]+/g, "_").slice(0, 160) || "arquivo";
+};
+
+const saveProjectQuoteFile = async ({ quoteId, fileName, fileBase64 }) => {
+  if (!fileBase64) return null;
+
+  await fs.mkdir(projectUploadDir, { recursive: true });
+  const safeName = sanitizeProjectFileName(fileName);
+  const storedName = `${quoteId}_${safeName}`;
+  const filePath = path.join(projectUploadDir, storedName);
+  await fs.writeFile(filePath, Buffer.from(fileBase64, "base64"));
+  return filePath;
+};
+
+const projectLibraryDir = path.join(process.cwd(), "data", "project-library");
+
+const assertProjectFilePath = (filePath, rootDir) => {
+  const resolvedPath = path.resolve(filePath);
+  const resolvedRoot = path.resolve(rootDir);
+  if (!resolvedPath.startsWith(resolvedRoot)) {
+    throw new Error("Caminho de arquivo invalido");
+  }
+  return resolvedPath;
+};
+
+const normalizeProjectFile = (file) => ({
+  ...file,
+  filePath: undefined,
+  fileSize: Number(file.fileSize) || 0,
+});
+
+const attachProjectQuoteToOrder = async (order) => {
+  const items = parseJSON(order.items);
+  const quoteId = Array.isArray(items)
+    ? items.find((item) => item.projectQuoteId)?.projectQuoteId
+    : null;
+
+  if (!quoteId) {
+    return {
+      ...order,
+      items,
+    };
+  }
+
+  const quote = await db("project_quotes").where({ id: quoteId }).first();
+  return {
+    ...order,
+    items,
+    projectQuote: quote ? normalizeProjectQuote(quote) : undefined,
+  };
+};
+
+app.post("/api/project-quotes", async (req, res) => {
+  try {
+    const {
+      userId,
+      userName,
+      fileName,
+      fileSize,
+      projectLink,
+      size,
+      height,
+      width,
+      depth,
+      colorQuantity,
+      colors,
+      pieceQuantity,
+      shippingData,
+      fileBase64,
+    } = req.body;
+
+    const hasFile = Boolean(fileName && fileBase64);
+    const hasProjectLink = Boolean(String(projectLink || "").trim());
+
+    if (!userId || (!hasFile && !hasProjectLink)) {
+      return res.status(400).json({ error: "Envie um arquivo ou informe o link do projeto" });
+    }
+
+    const quoteId = `quote_${Date.now()}`;
+    const filePath = await saveProjectQuoteFile({
+      quoteId,
+      fileName,
+      fileBase64,
+    });
+
+    const quote = {
+      id: quoteId,
+      userId,
+      userName: userName || "Cliente",
+      fileName: fileName || "Link do projeto",
+      fileSize: Number(fileSize) || 0,
+      filePath,
+      projectLink: String(projectLink || "").trim() || null,
+      size: size || "",
+      height: height || "",
+      width: width || "",
+      depth: depth || "",
+      colorQuantity: colorQuantity || "",
+      colors: colors || "",
+      pieceQuantity: pieceQuantity || "",
+      shippingData: shippingData || "",
+      status: "pending",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    await db("project_quotes").insert(quote);
+    res.status(201).json(normalizeProjectQuote(quote));
+  } catch (e) {
+    console.error("Erro ao criar orcamento:", e);
+    res.status(500).json({ error: "Erro ao criar orcamento" });
+  }
+});
+
+app.get("/api/users/:userId/project-quotes", async (req, res) => {
+  try {
+    const quotes = await getProjectQuotesWithCustomerPhones(
+      db("project_quotes")
+        .where({ userId: req.params.userId })
+        .orderBy("createdAt", "desc"),
+    );
+    res.json(quotes);
+  } catch (e) {
+    console.error("Erro ao buscar orcamentos do cliente:", e);
+    res.status(500).json({ error: "Erro ao buscar orcamentos" });
+  }
+});
+
+app.get(
+  "/api/admin/project-quotes",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const quotes = await getProjectQuotesWithCustomerPhones(
+        db("project_quotes").orderBy("createdAt", "desc"),
+      );
+      res.json(quotes);
+    } catch (e) {
+      console.error("Erro ao buscar orcamentos admin:", e);
+      res.status(500).json({ error: "Erro ao buscar orcamentos" });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/project-quotes/:id/download",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const quote = await db("project_quotes").where({ id: req.params.id }).first();
+
+      if (!quote || !quote.filePath) {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
+
+      const resolvedPath = assertProjectFilePath(quote.filePath, projectUploadDir);
+
+      await fs.access(resolvedPath);
+      res.download(resolvedPath, sanitizeProjectFileName(quote.fileName));
+    } catch (e) {
+      console.error("Erro ao baixar arquivo do orcamento:", e);
+      res.status(500).json({ error: "Erro ao baixar arquivo" });
+    }
+  },
+);
+
+app.get("/api/orders/:id/project-file", async (req, res) => {
+  try {
+    const order = await db("orders").where({ id: req.params.id }).first();
+
+    if (!order) {
+      return res.status(404).json({ error: "Pedido nao encontrado" });
+    }
+
+    const items = parseJSON(order.items);
+    const quoteId = Array.isArray(items)
+      ? items.find((item) => item.projectQuoteId)?.projectQuoteId
+      : null;
+
+    if (!quoteId) {
+      return res.status(404).json({ error: "Arquivo nao encontrado" });
+    }
+
+    const quote = await db("project_quotes").where({ id: quoteId }).first();
+    if (!quote || !quote.filePath) {
+      return res.status(404).json({ error: "Arquivo nao encontrado" });
+    }
+
+    const resolvedPath = assertProjectFilePath(quote.filePath, projectUploadDir);
+    await fs.access(resolvedPath);
+    res.download(resolvedPath, sanitizeProjectFileName(quote.fileName));
+  } catch (e) {
+    console.error("Erro ao baixar arquivo do pedido:", e);
+    res.status(500).json({ error: "Erro ao baixar arquivo" });
+  }
+});
+
+app.post(
+  "/api/admin/project-quotes/:id/save-file",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { note } = req.body || {};
+      const quote = await db("project_quotes").where({ id: req.params.id }).first();
+
+      if (!quote || !quote.filePath) {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
+
+      const sourcePath = assertProjectFilePath(quote.filePath, projectUploadDir);
+      await fs.access(sourcePath);
+      await fs.mkdir(projectLibraryDir, { recursive: true });
+
+      const fileId = `project_file_${Date.now()}`;
+      const safeName = sanitizeProjectFileName(quote.fileName);
+      const libraryPath = path.join(projectLibraryDir, `${fileId}_${safeName}`);
+      await fs.copyFile(sourcePath, libraryPath);
+
+      const file = {
+        id: fileId,
+        sourceQuoteId: quote.id,
+        fileName: quote.fileName,
+        fileSize: Number(quote.fileSize) || 0,
+        filePath: libraryPath,
+        note: note || null,
+        createdAt: new Date().toISOString(),
+      };
+
+      await db("project_files").insert(file);
+      res.status(201).json(normalizeProjectFile(file));
+    } catch (e) {
+      console.error("Erro ao salvar arquivo na biblioteca:", e);
+      res.status(500).json({ error: "Erro ao salvar arquivo" });
+    }
+  },
+);
+
+app.delete(
+  "/api/admin/project-quotes/:id/file",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const quote = await db("project_quotes").where({ id: req.params.id }).first();
+
+      if (!quote || !quote.filePath) {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
+
+      const resolvedPath = assertProjectFilePath(quote.filePath, projectUploadDir);
+      await fs.unlink(resolvedPath).catch((err) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+      await db("project_quotes").where({ id: quote.id }).update({
+        filePath: null,
+        updatedAt: new Date().toISOString(),
+      });
+
+      res.json({ ok: true, quoteId: quote.id });
+    } catch (e) {
+      console.error("Erro ao excluir arquivo do orcamento:", e);
+      res.status(500).json({ error: "Erro ao excluir arquivo" });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/project-files",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const files = await db("project_files").orderBy("createdAt", "desc");
+      res.json(files.map(normalizeProjectFile));
+    } catch (e) {
+      console.error("Erro ao buscar biblioteca de arquivos:", e);
+      res.status(500).json({ error: "Erro ao buscar arquivos" });
+    }
+  },
+);
+
+app.get(
+  "/api/admin/project-files/:id/download",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const file = await db("project_files").where({ id: req.params.id }).first();
+
+      if (!file || !file.filePath) {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
+
+      const resolvedPath = assertProjectFilePath(file.filePath, projectLibraryDir);
+      await fs.access(resolvedPath);
+      res.download(resolvedPath, sanitizeProjectFileName(file.fileName));
+    } catch (e) {
+      console.error("Erro ao baixar arquivo salvo:", e);
+      res.status(500).json({ error: "Erro ao baixar arquivo" });
+    }
+  },
+);
+
+app.delete(
+  "/api/admin/project-files/:id",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const file = await db("project_files").where({ id: req.params.id }).first();
+
+      if (!file) {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
+
+      const resolvedPath = assertProjectFilePath(file.filePath, projectLibraryDir);
+      await fs.unlink(resolvedPath).catch((err) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+      await db("project_files").where({ id: file.id }).del();
+
+      res.json({ ok: true, fileId: file.id });
+    } catch (e) {
+      console.error("Erro ao excluir arquivo salvo:", e);
+      res.status(500).json({ error: "Erro ao excluir arquivo" });
+    }
+  },
+);
+
+app.put(
+  "/api/admin/project-quotes/:id",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    try {
+      const { quotedTotal, adminObservation, deliveryDeadline } = req.body;
+      const quote = await db("project_quotes").where({ id: req.params.id }).first();
+
+      if (!quote) {
+        return res.status(404).json({ error: "Orcamento nao encontrado" });
+      }
+
+      const total = Number(quotedTotal);
+      if (!Number.isFinite(total) || total <= 0 || !deliveryDeadline) {
+        return res.status(400).json({
+          error: "Informe valor do orcamento e prazo de entrega",
+        });
+      }
+
+      await db("project_quotes")
+        .where({ id: quote.id })
+        .update({
+          quotedTotal: total,
+          adminObservation: adminObservation || null,
+          deliveryDeadline,
+          status: "sent",
+          updatedAt: new Date().toISOString(),
+        });
+
+      const updated = await db("project_quotes").where({ id: quote.id }).first();
+      res.json(normalizeProjectQuote(updated));
+    } catch (e) {
+      console.error("Erro ao responder orcamento:", e);
+      res.status(500).json({ error: "Erro ao responder orcamento" });
+    }
+  },
+);
+
+app.put("/api/project-quotes/:id/respond", async (req, res) => {
+  try {
+    const { approved, userId } = req.body;
+    const quote = await db("project_quotes").where({ id: req.params.id }).first();
+
+    if (!quote || (userId && quote.userId !== userId)) {
+      return res.status(404).json({ error: "Orcamento nao encontrado" });
+    }
+
+    if (quote.status !== "sent") {
+      return res.status(400).json({
+        error: "Apenas orcamentos enviados pelo admin podem ser respondidos",
+      });
+    }
+
+    if (!approved) {
+      await db("project_quotes")
+        .where({ id: quote.id })
+        .update({ status: "rejected", updatedAt: new Date().toISOString() });
+      const rejected = await db("project_quotes").where({ id: quote.id }).first();
+      return res.json(normalizeProjectQuote(rejected));
+    }
+
+    const total = Number(quote.quotedTotal) || 0;
+    const quoteProductId = `quote_product_${quote.id}`;
+    const orderItem = {
+      id: quoteProductId,
+      productId: quoteProductId,
+      name: `Projeto 3D - ${quote.fileName}`,
+      quantity: 1,
+      price: total,
+      originalUnitPrice: total,
+      customUnitPrice: total,
+      discountPercent: 0,
+      category: "Projeto 3D",
+      projectQuoteId: quote.id,
+      projectFileName: quote.fileName,
+      projectSize: quote.size,
+      projectHeight: quote.height,
+      projectWidth: quote.width,
+      projectDepth: quote.depth,
+      projectColorQuantity: quote.colorQuantity,
+      projectColors: quote.colors,
+      projectPieceQuantity: quote.pieceQuantity,
+      projectShippingData: quote.shippingData,
+      projectDeliveryDeadline: quote.deliveryDeadline,
+      projectAdminObservation: quote.adminObservation,
+      projectHasFile: !!quote.filePath,
+    };
+
+    const order = {
+      id: `order_${Date.now()}`,
+      userId: quote.userId,
+      userName: quote.userName || "Cliente",
+      total,
+      timestamp: new Date().toISOString(),
+      status: "pending",
+      paymentStatus: "pending",
+      paymentId: null,
+      paymentType: "orcamento",
+      paymentMethod: null,
+      items: JSON.stringify([orderItem]),
+      observation: [
+        "Pedido criado a partir de orcamento de projeto 3D.",
+        `Arquivo: ${quote.fileName}`,
+        `Tamanho: ${quote.size}`,
+        `Medidas: ${quote.height} x ${quote.width} x ${quote.depth}`,
+        `Cores: ${quote.colorQuantity} - ${quote.colors}`,
+        `Pecas: ${quote.pieceQuantity}`,
+        quote.adminObservation ? `Obs. admin: ${quote.adminObservation}` : null,
+        quote.deliveryDeadline ? `Prazo: ${quote.deliveryDeadline}` : null,
+        `Dados de envio: ${quote.shippingData}`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      created_at: new Date(),
+    };
+
+    const hasProductActiveColumn = await db.schema.hasColumn("products", "active");
+    const hasProductQuantityColumn = await db.schema.hasColumn(
+      "products",
+      "quantidadeVenda",
+    );
+
+    await db.transaction(async (trx) => {
+      const quoteProduct = await trx("products")
+        .where({ id: quoteProductId })
+        .first();
+
+      if (!quoteProduct) {
+        const internalProduct = {
+          id: quoteProductId,
+          name: orderItem.name,
+          price: total,
+          compareAtPrice: null,
+          priceRaw: 0,
+          category: "Projeto 3D",
+          imageUrl: "",
+          images: JSON.stringify([]),
+          videoUrl: "",
+          popular: false,
+          stock: null,
+          stock_reserved: 0,
+          minStock: 0,
+        };
+
+        if (hasProductActiveColumn) {
+          internalProduct.active = false;
+        }
+        if (hasProductQuantityColumn) {
+          internalProduct.quantidadeVenda = 1;
+        }
+
+        await trx("products").insert(internalProduct);
+      }
+
+      await trx("orders").insert(order);
+      await trx("order_products").insert({
+        order_id: order.id,
+        product_id: quoteProductId,
+        product_name: orderItem.name,
+        quantity: 1,
+        price: total,
+        originalUnitPrice: total,
+        customUnitPrice: total,
+        discountPercent: 0,
+      });
+      await trx("project_quotes")
+        .where({ id: quote.id })
+        .update({
+          status: "approved",
+          orderId: order.id,
+          updatedAt: new Date().toISOString(),
+        });
+    });
+
+    const updated = await db("project_quotes").where({ id: quote.id }).first();
+    res.json({
+      quote: normalizeProjectQuote(updated),
+      order: { ...order, items: [orderItem] },
+    });
+  } catch (e) {
+    console.error("Erro ao responder orcamento:", e);
+    res.status(500).json({ error: "Erro ao responder orcamento" });
+  }
+});
+
 app.get(
   "/api/admin/stock-movements",
   authenticateToken,
@@ -1617,6 +2305,12 @@ app.get(
 
           return {
             ...p,
+            price: p.price !== undefined ? parseFloat(p.price) : 0,
+            compareAtPrice:
+              p.compareAtPrice !== undefined && p.compareAtPrice !== null
+                ? parseFloat(p.compareAtPrice)
+                : null,
+            priceRaw: p.priceRaw !== undefined ? parseFloat(p.priceRaw) : 0,
             imageUrl: normalizedImages[0] || p.imageUrl || null,
             images: normalizedImages,
           };
@@ -1638,6 +2332,7 @@ app.post(
       id,
       name,
       price,
+      compareAtPrice,
       priceRaw,
       category,
       imageUrl,
@@ -1667,6 +2362,10 @@ app.post(
         id: id || `prod_${Date.now()}`,
         name,
         price: parseFloat(price),
+        compareAtPrice:
+          compareAtPrice !== undefined && compareAtPrice !== null && compareAtPrice !== ""
+            ? parseFloat(compareAtPrice)
+            : null,
         priceRaw: priceRaw !== undefined ? parseFloat(priceRaw) : 0,
         category,
         imageUrl: primaryImage,
@@ -1687,7 +2386,7 @@ app.post(
       res.status(201).json({
         ...newProduct,
         images: parseJSON(newProduct.images),
-        isAvailable: newProduct.stock === null || newProduct.stock > 0,
+        isAvailable: true,
       });
     } catch (e) {
       console.error("Erro ao criar produto:", e);
@@ -1705,6 +2404,7 @@ app.put(
     const {
       name,
       price,
+      compareAtPrice,
       priceRaw,
       category,
       imageUrl,
@@ -1728,6 +2428,12 @@ app.put(
       const updates = {};
       if (name !== undefined) updates.name = name;
       if (price !== undefined) updates.price = parseFloat(price);
+      if (compareAtPrice !== undefined) {
+        updates.compareAtPrice =
+          compareAtPrice !== null && compareAtPrice !== ""
+            ? parseFloat(compareAtPrice)
+            : null;
+      }
       if (priceRaw !== undefined) updates.priceRaw = parseFloat(priceRaw);
       if (category !== undefined) updates.category = category;
       if (imageUrl !== undefined) {
@@ -1783,7 +2489,11 @@ app.put(
           return updated.imageUrl ? [updated.imageUrl] : [];
         })(),
         price: parseFloat(updated.price),
-        isAvailable: updated.stock === null || updated.stock > 0,
+        compareAtPrice:
+          updated.compareAtPrice !== undefined && updated.compareAtPrice !== null
+            ? parseFloat(updated.compareAtPrice)
+            : null,
+        isAvailable: true,
       });
     } catch (e) {
       console.error("Erro ao atualizar produto:", e);
@@ -1981,6 +2691,48 @@ app.get("/api/users/cpf/:cpf", async (req, res) => {
   } catch (e) {
     console.error("❌ Erro ao buscar usuário por documento:", e);
     res.status(500).json({ error: "Erro ao buscar usuário" });
+  }
+});
+
+app.get("/api/admincustomer/customers", async (req, res) => {
+  try {
+    const { adminCustomerId } = req.query;
+
+    if (!adminCustomerId) {
+      return res.status(400).json({ error: "adminCustomerId obrigatorio" });
+    }
+
+    const requester =
+      String(adminCustomerId) === "admin_user"
+        ? { role: "admin" }
+        : await db("users").where({ id: String(adminCustomerId) }).first();
+
+    if (
+      !requester ||
+      (requester.role !== "admincustomer" && requester.role !== "admin")
+    ) {
+      return res.status(403).json({ error: "Acesso nao autorizado" });
+    }
+
+    const users = await db("users").select("*").orderBy("name", "asc");
+
+    res.json(
+      users
+        .filter((user) => (user.role || "customer") === "customer")
+        .map((user) => ({
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          cpf: user.cpf,
+          phone: user.phone,
+          telefone: user.telefone || user.phone,
+          role: user.role || "customer",
+          historico: [],
+        })),
+    );
+  } catch (e) {
+    console.error("Erro ao listar clientes para admincustomer:", e);
+    res.status(500).json({ error: "Erro ao buscar clientes" });
   }
 });
 
@@ -2255,7 +3007,7 @@ app.post("/api/orders", async (req, res) => {
         });
       }
 
-      // 2. Checagem de estoque e captura do custo atual do produto
+      // 2. Captura do produto atual sem bloquear venda por estoque
       const productsById = new Map();
       for (const item of items) {
         const product = await trx("products").where({ id: item.id }).first();
@@ -2263,22 +3015,21 @@ app.post("/api/orders", async (req, res) => {
           throw new Error(`Produto ${item.id} não encontrado no estoque!`);
         }
         productsById.set(String(item.id), product);
-        if (product.stock !== null && product.stock < item.quantity) {
-          throw new Error(
-            `Estoque insuficiente para ${item.name}. Disponível: ${product.stock}, Solicitado: ${item.quantity}`,
-          );
-        }
       }
 
       // 3. Salva um snapshot do custo em cada item vendido
       const itemsWithPrecoBruto = Array.isArray(items)
-        ? items.map((item) => ({
-            ...item,
-            precoBruto:
-              item.precoBruto !== undefined
-                ? Number(item.precoBruto)
-                : Number(productsById.get(String(item.id))?.priceRaw) || 0,
-          }))
+        ? items.map((item) => {
+            const product = productsById.get(String(item.id));
+            return {
+              ...item,
+              ...getOrderItemPricingSnapshot(item, product),
+              precoBruto:
+                item.precoBruto !== undefined
+                  ? Number(item.precoBruto)
+                  : Number(product?.priceRaw) || 0,
+            };
+          })
         : [];
 
       const newOrder = {
@@ -2304,12 +3055,21 @@ app.post("/api/orders", async (req, res) => {
 
       // 5. Salva os itens do pedido na tabela order_products
       if (Array.isArray(items) && items.length > 0) {
-        const orderProducts = items.map((item) => ({
-          order_id: newOrder.id,
-          product_id: item.id,
-          quantity: item.quantity || 1,
-          price: item.price !== undefined ? item.price : 0,
-        }));
+        const orderProducts = items.map((item) => {
+          const product = productsById.get(String(item.id));
+          const pricing = getOrderItemPricingSnapshot(item, product);
+
+          return {
+            order_id: newOrder.id,
+            product_id: item.id,
+            product_name: item.name,
+            quantity: item.quantity || 1,
+            price: pricing.price,
+            originalUnitPrice: pricing.originalUnitPrice,
+            customUnitPrice: pricing.customUnitPrice,
+            discountPercent: pricing.discountPercent,
+          };
+        });
         await trx("order_products").insert(orderProducts);
       }
 
@@ -2330,7 +3090,13 @@ app.get("/api/users/:userId/orders", async (req, res) => {
     const orders = await db("orders")
       .where({ userId })
       .orderBy("timestamp", "desc");
-    res.json(orders);
+    const formattedOrders = await Promise.all(
+      orders.map(async (order) => ({
+        ...(await attachProjectQuoteToOrder(order)),
+        total: parseFloat(order.total),
+      })),
+    );
+    res.json(formattedOrders);
   } catch (e) {
     console.error("❌ Erro ao buscar pedidos do usuário:", e);
     res.status(500).json({ error: "Erro ao buscar pedidos do usuário" });
@@ -2490,7 +3256,7 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
 
 app.put("/api/orders/:id", async (req, res) => {
   const { id } = req.params;
-  let { paymentId, paymentStatus } = req.body;
+  let { paymentId, paymentStatus, items, total } = req.body;
   // Importa serviço de pagamento para validação
   const { checkPaymentStatus } = await import("./services/paymentService.js");
 
@@ -2522,6 +3288,89 @@ app.put("/api/orders/:id", async (req, res) => {
     const updates = {};
     if (paymentId !== undefined) updates.paymentId = paymentId;
     if (paymentStatus) updates.paymentStatus = paymentStatus;
+
+    if (items !== undefined) {
+      if (!Array.isArray(items) || items.length === 0) {
+        return res
+          .status(400)
+          .json({ error: "Pedido precisa ter pelo menos um item" });
+      }
+
+      const productsById = new Map();
+      for (const item of items) {
+        const productId = String(item.productId || item.id || "");
+        if (!productId) {
+          return res.status(400).json({ error: "Item sem produto" });
+        }
+
+        const product = await db("products").where({ id: productId }).first();
+        if (product) {
+          productsById.set(productId, product);
+        }
+      }
+
+      const normalizedItems = items.map((item) => {
+        const productId = String(item.productId || item.id);
+        const product = productsById.get(productId);
+        const quantity = Math.max(1, Number(item.quantity) || 1);
+        const price = Math.max(0, Number(item.price) || 0);
+        const pricing = getOrderItemPricingSnapshot(
+          {
+            ...item,
+            id: productId,
+            productId,
+            price,
+            quantity,
+            customUnitPrice:
+              item.customUnitPrice !== undefined
+                ? item.customUnitPrice
+                : price,
+          },
+          product,
+        );
+
+        return {
+          ...item,
+          id: productId,
+          productId,
+          name: item.name || product?.name || "Produto",
+          quantity,
+          price: pricing.price,
+          originalUnitPrice: pricing.originalUnitPrice,
+          customUnitPrice: pricing.customUnitPrice,
+          discountPercent: pricing.discountPercent,
+          precoBruto:
+            item.precoBruto !== undefined
+              ? Number(item.precoBruto)
+              : Number(product?.priceRaw) || 0,
+        };
+      });
+
+      const nextTotal =
+        total !== undefined
+          ? Math.max(0, Number(total) || 0)
+          : normalizedItems.reduce(
+              (sum, item) => sum + Number(item.price || 0) * item.quantity,
+              0,
+            );
+
+      updates.items = JSON.stringify(normalizedItems);
+      updates.total = Number(nextTotal.toFixed(2));
+
+      await db("order_products").where({ order_id: id }).del();
+      await db("order_products").insert(
+        normalizedItems.map((item) => ({
+          order_id: id,
+          product_id: item.productId || item.id,
+          product_name: item.name,
+          quantity: item.quantity,
+          price: item.price,
+          originalUnitPrice: item.originalUnitPrice,
+          customUnitPrice: item.customUnitPrice,
+          discountPercent: item.discountPercent,
+        })),
+      );
+    }
 
     // 🎯 Validação real do pagamento antes de liberar pedido
     let isPaymentApproved = false;
@@ -2823,17 +3672,18 @@ app.get("/api/orders/history", async (req, res) => {
     console.log(
       `📋 [GET /api/orders/history] Encontrados ${orders.length} pedidos`,
     );
-    const parsedOrders = orders.map((o) => ({
-      ...o,
-      items: typeof o.items === "string" ? JSON.parse(o.items) : o.items,
-      total: parseFloat(o.total),
-      paymentMethod:
-        o.paymentMethod ||
-        o.payment_method ||
-        o.payment_method_id ||
-        o.paymentType ||
-        "-",
-    }));
+    const parsedOrders = await Promise.all(
+      orders.map(async (o) => ({
+        ...(await attachProjectQuoteToOrder(o)),
+        total: parseFloat(o.total),
+        paymentMethod:
+          o.paymentMethod ||
+          o.payment_method ||
+          o.payment_method_id ||
+          o.paymentType ||
+          "-",
+      })),
+    );
     res.json(parsedOrders);
   } catch (e) {
     console.error("❌ [GET /api/orders/history] Erro:", e);
@@ -2852,8 +3702,7 @@ app.get("/api/orders/:id", async (req, res) => {
       return res.status(404).json({ error: "Pedido não encontrado" });
     }
     res.json({
-      ...order,
-      items: parseJSON(order.items),
+      ...(await attachProjectQuoteToOrder(order)),
       total: parseFloat(order.total),
     });
   } catch (e) {
@@ -4370,11 +5219,7 @@ app.post("/api/ai/suggestion", async (req, res) => {
       "stock",
     );
 
-    const availableProducts = products.filter(
-      (p) => p.stock === null || p.stock > 0,
-    );
-
-    const productList = availableProducts
+    const productList = products
       .map(
         (p) =>
           `- ${p.name} (${p.category}) - R$ ${p.price} ${

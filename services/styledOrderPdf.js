@@ -274,6 +274,18 @@ export async function generateStyledOrderPdf(order, res) {
       item.price !== undefined
         ? item.price
         : item.valor_unit || item.unit_price || 0;
+    const originalUnitPrice =
+      item.originalUnitPrice !== undefined && item.originalUnitPrice !== null
+        ? Number(item.originalUnitPrice)
+        : null;
+    const customUnitPrice =
+      item.customUnitPrice !== undefined && item.customUnitPrice !== null
+        ? Number(item.customUnitPrice)
+        : null;
+    const discountPercent =
+      item.discountPercent !== undefined && item.discountPercent !== null
+        ? Number(item.discountPercent)
+        : 0;
     doc
       .font("Helvetica")
       .fontSize(11)
@@ -282,6 +294,28 @@ export async function generateStyledOrderPdf(order, res) {
       .text(`R$ ${(valor || 0).toFixed(2)}`, 250, y)
       .text(`R$ ${(valor * qtd).toFixed(2)}`, 350, y);
     y += 16;
+    if (
+      (originalUnitPrice && originalUnitPrice > Number(valor || 0)) ||
+      (customUnitPrice && customUnitPrice !== Number(valor || 0)) ||
+      discountPercent > 0
+    ) {
+      const details = [
+        customUnitPrice && customUnitPrice !== Number(valor || 0)
+          ? `Valor admin: R$ ${customUnitPrice.toFixed(2)}`
+          : null,
+        discountPercent > 0
+          ? `Desconto: ${discountPercent.toFixed(2)}%`
+          : null,
+        originalUnitPrice && originalUnitPrice > Number(valor || 0)
+          ? `Original: R$ ${originalUnitPrice.toFixed(2)}`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" | ");
+      doc.font("Helvetica").fontSize(9).fillColor("#666").text(details, 40, y);
+      doc.fillColor("#000");
+      y += 12;
+    }
   });
 
   // Total
