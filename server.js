@@ -551,7 +551,7 @@ async function initDatabase() {
       );
       const { generateStyledOrderPdf } =
         await import("./services/styledOrderPdf.js");
-      generateStyledOrderPdf(order, res);
+      await generateStyledOrderPdf(order, res);
     } catch (error) {
       console.error("Erro ao gerar PDF do pedido:", error);
       res.status(500).json({ error: "Erro ao gerar PDF do pedido" });

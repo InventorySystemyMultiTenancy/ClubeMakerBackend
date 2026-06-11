@@ -1,20 +1,96 @@
 import PDFDocument from "pdfkit";
 import path from "path";
 import fs from "fs";
+import axios from "axios";
 
-export function generateStyledOrderPdf(order, res) {
+function getFrontendCandidates() {
+  const allOrigins = (process.env.FRONTEND_URL || "")
+    .split(",")
+    .map((url) => url.trim())
+    .filter(Boolean);
+
+  // Prioriza domínios da ClubeMaker quando FRONTEND_URL possui múltiplas origens
+  const prioritizedOrigins = [
+    ...allOrigins.filter((url) => /club(e|s)?maker/i.test(url)),
+    ...allOrigins.filter((url) => !/club(e|s)?maker/i.test(url)),
+  ];
+
+  return prioritizedOrigins.flatMap((baseUrl) => {
+    const sanitized = baseUrl.replace(/\/$/, "");
+    return [
+      `${sanitized}/logo-clubemaker.png`,
+      `${sanitized}/clubemaker-logo.png`,
+      `${sanitized}/logo.png`,
+      `${sanitized}/images/logo.png`,
+      `${sanitized}/assets/logo.png`,
+      `${sanitized}/_next/static/media/logo.png`,
+    ];
+  });
+}
+
+function getLocalLogoCandidates() {
+  const customLogoPath = process.env.CLUBEMAKER_LOGO_PATH || process.env.PDF_LOGO_PATH;
+  const basePublic = path.join(process.cwd(), "public");
+
+  return [
+    customLogoPath,
+    path.join(basePublic, "logo-clubemaker.png"),
+    path.join(basePublic, "clubemaker-logo.png"),
+    path.join(basePublic, "clubemaker.png"),
+    path.join(basePublic, "logo.png"),
+  ].filter(Boolean);
+}
+
+async function resolveLogoSource() {
+  // 1) Prioridade para logos locais da ClubeMaker
+  const localCandidates = getLocalLogoCandidates();
+  for (const logoPath of localCandidates) {
+    if (fs.existsSync(logoPath)) {
+      return { type: "path", value: logoPath };
+    }
+  }
+
+  // 2) Se não existir localmente, tenta buscar do frontend
+  const explicitLogoUrls = [
+    process.env.CLUBEMAKER_LOGO_URL,
+    process.env.PDF_LOGO_URL,
+  ].filter(Boolean);
+
+  const remoteCandidates = [...explicitLogoUrls, ...getFrontendCandidates()];
+  for (const logoUrl of remoteCandidates) {
+    try {
+      const response = await axios.get(logoUrl, {
+        responseType: "arraybuffer",
+        timeout: 4000,
+      });
+
+      if (response?.status >= 200 && response?.status < 300 && response.data) {
+        return { type: "buffer", value: Buffer.from(response.data) };
+      }
+    } catch (error) {
+      // Ignora falhas individuais e tenta a próxima URL
+    }
+  }
+
+  return null;
+}
+
+export async function generateStyledOrderPdf(order, res) {
   const doc = new PDFDocument({ margin: 40, size: "A4" });
   doc.pipe(res);
 
   // Centralizar logo com espaçamento adequado
-  const logoPath = path.join(process.cwd(), "public", "logo.png");
+  const logoSource = await resolveLogoSource();
   let y = 40;
-  if (fs.existsSync(logoPath)) {
+  if (logoSource) {
     const logoWidth = 120;
     const logoHeight = 120;
     const pageWidth = doc.page.width;
     const xLogo = (pageWidth - logoWidth) / 2;
-    doc.image(logoPath, xLogo, y, { width: logoWidth, height: logoHeight });
+    doc.image(logoSource.value, xLogo, y, {
+      width: logoWidth,
+      height: logoHeight,
+    });
     y += logoHeight + 30; // Mais espaço após logo
   }
 
