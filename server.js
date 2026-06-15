@@ -156,6 +156,36 @@ const parseJSON = (data) => {
 };
 
 // Helper para registrar movimentações de estoque no banco
+const OUTSIDE_ORDER_PAYMENT_METHOD = "pedido_feito_por_fora";
+
+const normalizeOrderText = (value) =>
+  String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const isOutsideOrderPayment = (...values) =>
+  values.some((value) => {
+    const normalized = normalizeOrderText(value);
+    return (
+      normalized === "pedido feito por fora" ||
+      normalized === "pedido por fora" ||
+      normalized === "outside order"
+    );
+  });
+
+const getOutsideBuyerName = (body = {}) =>
+  String(
+    body.externalBuyerName ||
+      body.outsideBuyerName ||
+      body.customerName ||
+      body.buyerName ||
+      "",
+  ).trim();
+
 async function logStockMovement({
   productId,
   productName,
@@ -296,6 +326,11 @@ async function initDatabase() {
     { name: "paymentMethod", type: "string" },
     { name: "installments", type: "integer" },
     { name: "fee", type: "decimal" },
+    { name: "externalBuyerName", type: "string" },
+    { name: "createdByRole", type: "string" },
+    { name: "createdByName", type: "string" },
+    { name: "createdByUserId", type: "string" },
+    { name: "createdByAdmin", type: "boolean" },
   ];
   for (const col of paymentCols) {
     const hasCol = await db.schema.hasColumn("orders", col.name);
@@ -304,6 +339,7 @@ async function initDatabase() {
         if (col.type === "string") table.string(col.name);
         if (col.type === "integer") table.integer(col.name);
         if (col.type === "decimal") table.decimal(col.name, 8, 2);
+        if (col.type === "boolean") table.boolean(col.name).defaultTo(false);
       });
       console.log(`✅ Coluna '${col.name}' adicionada à tabela orders`);
     }
@@ -456,11 +492,22 @@ async function initDatabase() {
       table.string("status").defaultTo("active");
       table.string("paymentStatus").defaultTo("pending");
       table.string("paymentId");
+      table.string("paymentType");
+      table.string("paymentMethod");
+      table.integer("installments");
+      table.decimal("fee", 8, 2);
       table.json("items").notNullable();
+      table.text("observation");
       table.timestamp("completedAt");
       table.boolean("hiddenFromHistory").defaultTo(false);
       table.timestamp("hiddenAt");
       table.string("hiddenBy");
+      table.string("externalBuyerName");
+      table.string("createdByRole");
+      table.string("createdByName");
+      table.string("createdByUserId");
+      table.boolean("createdByAdmin").defaultTo(false);
+      table.timestamp("created_at").defaultTo(db.fn.now());
     });
   }
 
@@ -1627,12 +1674,17 @@ app.get(
       };
 
       const normalizePaymentMethod = (method) => {
-        const normalized = String(method || "")
-          .toLowerCase()
-          .trim();
+        const normalized = normalizeOrderText(method);
 
         if (!normalized) {
           return { key: "outros", label: "Outros" };
+        }
+
+        if (isOutsideOrderPayment(normalized)) {
+          return {
+            key: OUTSIDE_ORDER_PAYMENT_METHOD,
+            label: "Pedido feito por fora",
+          };
         }
 
         if (normalized.includes("pix")) {
@@ -2989,17 +3041,56 @@ app.post("/api/orders", async (req, res) => {
     paymentMethod,
     installments,
     fee,
+    externalBuyerName,
+    outsideBuyerName,
+    customerName,
+    buyerName,
+    createdByName,
+    createdByUserId,
+    createdByRole,
+    createdByAdmin,
   } = req.body;
 
   try {
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Pedido precisa ter pelo menos um item" });
+    }
+
+    const outsidePayment = isOutsideOrderPayment(paymentType, paymentMethod);
+    const outsidePaymentBuyerName = getOutsideBuyerName({
+      externalBuyerName,
+      outsideBuyerName,
+      customerName,
+      buyerName,
+    });
+
+    if (outsidePayment && !outsidePaymentBuyerName) {
+      return res.status(400).json({
+        error: "Informe o nome de quem comprou para pedidos feitos por fora",
+      });
+    }
+
+    const effectiveUserName = outsidePayment
+      ? outsidePaymentBuyerName
+      : userName || "Cliente";
+    const effectiveUserId = outsidePayment && !userId ? null : userId;
+    const effectivePaymentType = outsidePayment
+      ? OUTSIDE_ORDER_PAYMENT_METHOD
+      : paymentType || null;
+    const effectivePaymentMethod = outsidePayment
+      ? OUTSIDE_ORDER_PAYMENT_METHOD
+      : paymentMethod || null;
+
     // Iniciamos uma transação para garantir integridade dos dados
     await db.transaction(async (trx) => {
       // 1. Garante que o usuário existe
-      const userExists = await trx("users").where({ id: userId }).first();
-      if (!userExists) {
+      const userExists = effectiveUserId
+        ? await trx("users").where({ id: effectiveUserId }).first()
+        : null;
+      if (effectiveUserId && !userExists) {
         await trx("users").insert({
-          id: userId,
-          name: userName || "Convidado",
+          id: effectiveUserId,
+          name: effectiveUserName || "Convidado",
           email: null,
           cpf: userDoc ? String(userDoc).replace(/\D/g, "") : null, // Salva o CPF/CNPJ aqui!
           historico: "[]",
@@ -3034,19 +3125,24 @@ app.post("/api/orders", async (req, res) => {
 
       const newOrder = {
         id: `order_${Date.now()}`,
-        userId: userId,
-        userName: userName || "Cliente",
+        userId: effectiveUserId,
+        userName: effectiveUserName,
         total: total,
         timestamp: new Date().toISOString(),
-        status: "pending",
-        paymentStatus: "pending",
+        status: outsidePayment ? "active" : "pending",
+        paymentStatus: outsidePayment ? "paid" : "pending",
         paymentId: paymentId || null,
-        paymentType: paymentType || null,
-        paymentMethod: paymentMethod || null,
+        paymentType: effectivePaymentType,
+        paymentMethod: effectivePaymentMethod,
         items: JSON.stringify(itemsWithPrecoBruto),
         observation: observation || null,
         installments: installments || null,
         fee: fee || null,
+        externalBuyerName: outsidePayment ? outsidePaymentBuyerName : null,
+        createdByRole: createdByRole || (outsidePayment ? "admin" : null),
+        createdByName: createdByName || null,
+        createdByUserId: createdByUserId || null,
+        createdByAdmin: Boolean(createdByAdmin || outsidePayment),
         created_at: new Date(),
       };
 
@@ -3074,6 +3170,34 @@ app.post("/api/orders", async (req, res) => {
       }
 
       console.log(`✅ Pedido ${newOrder.id} criado com sucesso!`);
+      if (outsidePayment) {
+        for (const item of itemsWithPrecoBruto) {
+          const product = productsById.get(String(item.id));
+          const quantity = Number(item.quantity) || 1;
+
+          if (product && product.stock !== null) {
+            const currentStock = Number(product.stock) || 0;
+            const currentReserved = Number(product.stock_reserved) || 0;
+            const newStock = Math.max(0, currentStock - quantity);
+            const newReserved = Math.max(0, currentReserved - quantity);
+
+            await trx("products").where({ id: item.id }).update({
+              stock: newStock,
+              stock_reserved: newReserved,
+            });
+
+            await trx("stock_movements").insert({
+              productId: item.id,
+              productName: item.name,
+              quantity: -quantity,
+              type: "sale",
+              orderId: newOrder.id,
+              created_at: new Date(),
+            });
+          }
+        }
+      }
+
       res.status(201).json({ ...newOrder, items: items || [] });
     });
   } catch (e) {
