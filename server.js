@@ -984,7 +984,7 @@ const authenticateToken = (req, res, next) => {
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
       console.log(`❌ Token inválido: ${err.message}`);
-      return res.status(403).json({ error: "Token inválido ou expirado." });
+      return res.status(401).json({ error: "Token inválido ou expirado." });
     }
     req.user = user; // Adiciona o payload do token (ex: { role: 'admin' }) à requisição
     next();
@@ -3129,8 +3129,8 @@ app.post("/api/orders", async (req, res) => {
         userName: effectiveUserName,
         total: total,
         timestamp: new Date().toISOString(),
-        status: outsidePayment ? "active" : "pending",
-        paymentStatus: outsidePayment ? "paid" : "pending",
+        status: "pending",
+        paymentStatus: "pending",
         paymentId: paymentId || null,
         paymentType: effectivePaymentType,
         paymentMethod: effectivePaymentMethod,
@@ -3170,34 +3170,6 @@ app.post("/api/orders", async (req, res) => {
       }
 
       console.log(`✅ Pedido ${newOrder.id} criado com sucesso!`);
-      if (outsidePayment) {
-        for (const item of itemsWithPrecoBruto) {
-          const product = productsById.get(String(item.id));
-          const quantity = Number(item.quantity) || 1;
-
-          if (product && product.stock !== null) {
-            const currentStock = Number(product.stock) || 0;
-            const currentReserved = Number(product.stock_reserved) || 0;
-            const newStock = Math.max(0, currentStock - quantity);
-            const newReserved = Math.max(0, currentReserved - quantity);
-
-            await trx("products").where({ id: item.id }).update({
-              stock: newStock,
-              stock_reserved: newReserved,
-            });
-
-            await trx("stock_movements").insert({
-              productId: item.id,
-              productName: item.name,
-              quantity: -quantity,
-              type: "sale",
-              orderId: newOrder.id,
-              created_at: new Date(),
-            });
-          }
-        }
-      }
-
       res.status(201).json({ ...newOrder, items: items || [] });
     });
   } catch (e) {
@@ -3735,6 +3707,17 @@ app.delete(
             stock: nextStock,
             stock_reserved: nextReserved,
           });
+
+          if (shouldRestoreStock) {
+            await trx("stock_movements").insert({
+              productId,
+              productName: item?.name || "Produto",
+              quantity,
+              type: "return",
+              orderId: id,
+              created_at: new Date(),
+            });
+          }
 
           restockedItems.push({
             productId,
