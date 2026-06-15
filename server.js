@@ -3765,7 +3765,10 @@ app.get("/api/orders/history", async (req, res) => {
       .where(function () {
         this.whereIn("paymentStatus", ["paid", "authorized"]).orWhere(
           function () {
-            this.where("paymentType", "presencial");
+            this.whereIn("paymentType", [
+              "presencial",
+              OUTSIDE_ORDER_PAYMENT_METHOD,
+            ]);
           },
         );
       })
