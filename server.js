@@ -19,6 +19,7 @@ import paymentRoutes from "./routes/payment.js";
 import * as paymentService from "./services/paymentService.js";
 import PDFDocument from "pdfkit";
 import superAdminRoutes from "./routes/superadmin.js";
+import { v2 as cloudinary } from "cloudinary";
 
 // Corrige importação para compatibilidade CommonJS/ESM
 // Se der erro, tente:
@@ -28,6 +29,22 @@ import superAdminRoutes from "./routes/superadmin.js";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+if (
+  process.env.CLOUDINARY_CLOUD_NAME &&
+  process.env.CLOUDINARY_API_KEY &&
+  process.env.CLOUDINARY_API_SECRET
+) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+} else {
+  console.warn(
+    "⚠️  Cloudinary não configurado (defina CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY e CLOUDINARY_API_SECRET) — upload de imagens ficará indisponível.",
+  );
+}
 
 const envFrontendOrigins = (process.env.FRONTEND_URL || "")
   .split(",")
@@ -2332,6 +2349,36 @@ app.get(
         error: "Erro ao gerar relatório de gestão",
         message: error.message,
       });
+    }
+  },
+);
+
+// Upload de imagem de produto (Admin) — recebe base64 e envia direto ao Cloudinary
+app.post(
+  "/api/admin/upload-image",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { imageBase64 } = req.body;
+
+    if (!imageBase64 || typeof imageBase64 !== "string") {
+      return res.status(400).json({ error: "Imagem não informada" });
+    }
+
+    if (!cloudinary.config().cloud_name) {
+      return res
+        .status(500)
+        .json({ error: "Upload de imagens não configurado no servidor" });
+    }
+
+    try {
+      const result = await cloudinary.uploader.upload(imageBase64, {
+        folder: "clubemaker/products",
+      });
+      res.json({ url: result.secure_url });
+    } catch (e) {
+      console.error("Erro ao enviar imagem para o Cloudinary:", e);
+      res.status(500).json({ error: "Erro ao enviar imagem" });
     }
   },
 );
