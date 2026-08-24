@@ -31,7 +31,11 @@ const JWT_SECRET = process.env.JWT_SECRET;
 
 // Parser próprio: este router é montado antes de app.use(express.json()) no
 // server.js, então não pode depender da ordem de middlewares globais.
-router.use(express.json({ limit: "10mb" }));
+// Aplicado por rota (nunca via router.use() sem path) pelo mesmo motivo do
+// authenticateToken logo abaixo: rodar para QUALQUER /api/* atropelaria o
+// limite de payload (50mb) que outras rotas do server.js precisam, por ex.
+// upload de imagem em base64.
+const jsonParser = express.json({ limit: "10mb" });
 
 // --- Autenticação (mesmo comportamento de server.js) ---
 function authenticateToken(req, res, next) {
@@ -70,21 +74,23 @@ function requireAdminOrOperator(req, res, next) {
 }
 
 // ========== LOGIN DO OPERADOR (público — precisa vir antes do authenticateToken) ==========
-router.post("/print-farm/operators/login", async (req, res) => {
+router.post("/print-farm/operators/login", jsonParser, async (req, res) => {
   try {
-    const { username, password } = req.body || {};
-    if (!username || !password) {
-      return res.status(400).json({ error: "Usuário e senha são obrigatórios" });
+    const { cpf, password } = req.body || {};
+    if (!cpf || !password) {
+      return res.status(400).json({ error: "CPF e senha são obrigatórios" });
     }
-    const operator = await db("print_operators")
-      .whereRaw("lower(username) = ?", [String(username).toLowerCase()])
-      .first();
+    const cpfClean = String(cpf).replace(/\D/g, "");
+    if (cpfClean.length !== 11) {
+      return res.status(400).json({ error: "CPF inválido. Digite 11 dígitos." });
+    }
+    const operator = await db("print_operators").where({ cpf: cpfClean }).first();
     if (!operator || !operator.active) {
-      return res.status(401).json({ error: "Usuário ou senha inválidos" });
+      return res.status(401).json({ error: "CPF ou senha inválidos" });
     }
     const ok = await bcrypt.compare(password, operator.password_hash);
     if (!ok) {
-      return res.status(401).json({ error: "Usuário ou senha inválidos" });
+      return res.status(401).json({ error: "CPF ou senha inválidos" });
     }
     if (!JWT_SECRET) {
       console.error("🚨 JWT_SECRET não está configurado!");
@@ -102,8 +108,11 @@ router.post("/print-farm/operators/login", async (req, res) => {
   }
 });
 
-// Tudo abaixo desta linha exige um token válido (admin OU operador, conforme a rota)
-router.use(authenticateToken);
+// IMPORTANTE: authenticateToken é aplicado por rota (nunca via router.use() sem path)
+// porque este router é montado em app.use("/api", printFarmRoutes) logo no início do
+// server.js — um router.use() sem path aqui rodaria para QUALQUER /api/*, inclusive
+// rotas completamente alheias definidas mais abaixo em server.js (ex: /api/users/check-cpf),
+// derrubando-as com 401 antes mesmo delas serem alcançadas.
 
 // ========== CRIAÇÃO DE TABELAS ==========
 export async function initPrintFarmTables() {
@@ -238,7 +247,7 @@ export async function initPrintFarmTables() {
     await db.schema.createTable("print_operators", (table) => {
       table.increments("id").primary();
       table.string("name").notNullable();
-      table.string("username").notNullable().unique();
+      table.string("cpf", 11).notNullable().unique();
       table.string("password_hash").notNullable();
       table.boolean("active").notNullable().defaultTo(true);
       table.timestamp("created_at").defaultTo(db.fn.now());
@@ -248,7 +257,7 @@ export async function initPrintFarmTables() {
 }
 
 // ========== PRINTERS ==========
-router.get("/printers", requireAdminOrOperator, async (req, res) => {
+router.get("/printers", jsonParser, authenticateToken, requireAdminOrOperator, async (req, res) => {
   try {
     const printers = await db("printers").select("*").orderBy("number");
     res.json(printers);
@@ -258,7 +267,7 @@ router.get("/printers", requireAdminOrOperator, async (req, res) => {
   }
 });
 
-router.post("/printers", requireAdmin, async (req, res) => {
+router.post("/printers", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { number, nickname, brand, model, purchase_date, notes } = req.body;
     if (!number) {
@@ -281,7 +290,7 @@ router.post("/printers", requireAdmin, async (req, res) => {
   }
 });
 
-router.put("/printers/:id", requireAdmin, async (req, res) => {
+router.put("/printers/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { nickname, brand, model, purchase_date, notes, status } = req.body;
     const fields = {};
@@ -312,7 +321,7 @@ router.put("/printers/:id", requireAdmin, async (req, res) => {
   }
 });
 
-router.delete("/printers/:id", requireAdmin, async (req, res) => {
+router.delete("/printers/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const printer = await db("printers").where({ id: req.params.id }).first();
     if (!printer) return res.status(404).json({ error: "Impressora não encontrada" });
@@ -328,7 +337,7 @@ router.delete("/printers/:id", requireAdmin, async (req, res) => {
 });
 
 // ========== PRINTER PARTS (manutenção) ==========
-router.get("/printers/:id/parts", requireAdmin, async (req, res) => {
+router.get("/printers/:id/parts", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const parts = await db("printer_parts")
       .where({ printer_id: req.params.id })
@@ -340,7 +349,7 @@ router.get("/printers/:id/parts", requireAdmin, async (req, res) => {
   }
 });
 
-router.post("/printers/:id/parts", requireAdmin, async (req, res) => {
+router.post("/printers/:id/parts", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const printer = await db("printers").where({ id: req.params.id }).first();
     if (!printer) return res.status(404).json({ error: "Impressora não encontrada" });
@@ -369,7 +378,7 @@ router.post("/printers/:id/parts", requireAdmin, async (req, res) => {
   }
 });
 
-router.put("/printer-parts/:id", requireAdmin, async (req, res) => {
+router.put("/printer-parts/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { part_type, lifespan_prints, replacement_cost } = req.body;
     const fields = {};
@@ -386,7 +395,7 @@ router.put("/printer-parts/:id", requireAdmin, async (req, res) => {
   }
 });
 
-router.post("/printer-parts/:id/replace", requireAdmin, async (req, res) => {
+router.post("/printer-parts/:id/replace", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const part = await db("printer_parts").where({ id: req.params.id }).first();
     if (!part) return res.status(404).json({ error: "Peça não encontrada" });
@@ -405,7 +414,7 @@ router.post("/printer-parts/:id/replace", requireAdmin, async (req, res) => {
   }
 });
 
-router.delete("/printer-parts/:id", requireAdmin, async (req, res) => {
+router.delete("/printer-parts/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     await db("printer_parts").where({ id: req.params.id }).del();
     res.json({ ok: true });
@@ -416,7 +425,7 @@ router.delete("/printer-parts/:id", requireAdmin, async (req, res) => {
 });
 
 // ========== FILAMENTS ==========
-router.get("/filaments", requireAdmin, async (req, res) => {
+router.get("/filaments", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const filaments = await db("filaments").select("*").orderBy("material");
     res.json(filaments);
@@ -426,7 +435,7 @@ router.get("/filaments", requireAdmin, async (req, res) => {
   }
 });
 
-router.post("/filaments", requireAdmin, async (req, res) => {
+router.post("/filaments", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { material, color, brand, cost_per_kg, stock_grams } = req.body;
     if (!material || cost_per_kg === undefined) {
@@ -445,7 +454,7 @@ router.post("/filaments", requireAdmin, async (req, res) => {
   }
 });
 
-router.put("/filaments/:id", requireAdmin, async (req, res) => {
+router.put("/filaments/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { material, color, brand, cost_per_kg, stock_grams } = req.body;
     const fields = {};
@@ -464,7 +473,7 @@ router.put("/filaments/:id", requireAdmin, async (req, res) => {
   }
 });
 
-router.delete("/filaments/:id", requireAdmin, async (req, res) => {
+router.delete("/filaments/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     await db("filaments").where({ id: req.params.id }).del();
     res.json({ ok: true });
@@ -475,7 +484,7 @@ router.delete("/filaments/:id", requireAdmin, async (req, res) => {
 });
 
 // ========== PRINT PRODUCTS (perfis de impressão) ==========
-router.get("/print-products", requireAdminOrOperator, async (req, res) => {
+router.get("/print-products", jsonParser, authenticateToken, requireAdminOrOperator, async (req, res) => {
   try {
     const products = await db("print_products as pp")
       .leftJoin("filaments as f", "pp.filament_id", "f.id")
@@ -493,7 +502,7 @@ router.get("/print-products", requireAdminOrOperator, async (req, res) => {
   }
 });
 
-router.post("/print-products", requireAdmin, async (req, res) => {
+router.post("/print-products", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const {
       name,
@@ -532,7 +541,7 @@ router.post("/print-products", requireAdmin, async (req, res) => {
   }
 });
 
-router.put("/print-products/:id", requireAdmin, async (req, res) => {
+router.put("/print-products/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const {
       name,
@@ -563,7 +572,7 @@ router.put("/print-products/:id", requireAdmin, async (req, res) => {
   }
 });
 
-router.delete("/print-products/:id", requireAdmin, async (req, res) => {
+router.delete("/print-products/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     await db("print_products").where({ id: req.params.id }).del();
     res.json({ ok: true });
@@ -574,7 +583,7 @@ router.delete("/print-products/:id", requireAdmin, async (req, res) => {
 });
 
 // ========== PRINT JOBS (ciclo de produção) ==========
-router.get("/print-jobs", requireAdmin, async (req, res) => {
+router.get("/print-jobs", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     let query = db("print_jobs as pj")
       .join("printers as pr", "pj.printer_id", "pr.id")
@@ -609,7 +618,7 @@ router.get("/print-jobs", requireAdmin, async (req, res) => {
 
 // Jobs em andamento/atrasados, com os dados mínimos para o painel operar a frota
 // (não expõe totais de negócio — isso fica em /print-farm/summary, admin-only).
-router.get("/print-farm/active-jobs", requireAdminOrOperator, async (req, res) => {
+router.get("/print-farm/active-jobs", jsonParser, authenticateToken, requireAdminOrOperator, async (req, res) => {
   try {
     const jobs = await db("print_jobs as pj")
       .join("printers as pr", "pj.printer_id", "pr.id")
@@ -638,7 +647,7 @@ router.get("/print-farm/active-jobs", requireAdminOrOperator, async (req, res) =
   }
 });
 
-router.post("/print-jobs/start", requireAdminOrOperator, async (req, res) => {
+router.post("/print-jobs/start", jsonParser, authenticateToken, requireAdminOrOperator, async (req, res) => {
   try {
     const { printer_id, print_product_id } = req.body;
     if (!printer_id || !print_product_id) {
@@ -701,7 +710,7 @@ router.post("/print-jobs/start", requireAdminOrOperator, async (req, res) => {
   }
 });
 
-router.post("/print-jobs/:id/finish", requireAdminOrOperator, async (req, res) => {
+router.post("/print-jobs/:id/finish", jsonParser, authenticateToken, requireAdminOrOperator, async (req, res) => {
   try {
     const { success_count, fail_count } = req.body;
     if (success_count === undefined || fail_count === undefined) {
@@ -766,7 +775,7 @@ router.post("/print-jobs/:id/finish", requireAdminOrOperator, async (req, res) =
 });
 
 // ========== MANUTENÇÃO (alertas de desgaste) ==========
-router.get("/print-farm/maintenance-alerts", requireAdmin, async (req, res) => {
+router.get("/print-farm/maintenance-alerts", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const parts = await db("printer_parts as pp")
       .join("printers as pr", "pp.printer_id", "pr.id")
@@ -794,7 +803,7 @@ router.get("/print-farm/maintenance-alerts", requireAdmin, async (req, res) => {
 
 // ========== RELATÓRIOS (perda, custo, lucro) ==========
 // Pode ser filtrado por uma impressora específica (?printer_id=) ou trazer a frota inteira.
-router.get("/print-farm/summary", requireAdmin, async (req, res) => {
+router.get("/print-farm/summary", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     let query = db("print_jobs as pj")
       .join("printers as pr", "pj.printer_id", "pr.id")
@@ -875,10 +884,10 @@ router.get("/print-farm/summary", requireAdmin, async (req, res) => {
 });
 
 // ========== OPERADORES (funcionários que ligam/desligam impressoras) ==========
-router.get("/print-farm/operators", requireAdmin, async (req, res) => {
+router.get("/print-farm/operators", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const operators = await db("print_operators")
-      .select("id", "name", "username", "active", "created_at")
+      .select("id", "name", "cpf", "active", "created_at")
       .orderBy("name");
     res.json(operators);
   } catch (e) {
@@ -887,27 +896,29 @@ router.get("/print-farm/operators", requireAdmin, async (req, res) => {
   }
 });
 
-router.post("/print-farm/operators", requireAdmin, async (req, res) => {
+router.post("/print-farm/operators", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, username, password } = req.body;
-    if (!name || !username || !password) {
-      return res.status(400).json({ error: "Nome, usuário e senha são obrigatórios" });
+    const { name, cpf, password } = req.body;
+    if (!name || !cpf || !password) {
+      return res.status(400).json({ error: "Nome, CPF e senha são obrigatórios" });
+    }
+    const cpfClean = String(cpf).replace(/\D/g, "");
+    if (cpfClean.length !== 11) {
+      return res.status(400).json({ error: "CPF inválido. Digite 11 dígitos." });
     }
     if (password.length < 4) {
       return res.status(400).json({ error: "Senha deve ter pelo menos 4 caracteres" });
     }
-    const existing = await db("print_operators")
-      .whereRaw("lower(username) = ?", [username.toLowerCase()])
-      .first();
+    const existing = await db("print_operators").where({ cpf: cpfClean }).first();
     if (existing) {
-      return res.status(409).json({ error: "Já existe um operador com esse usuário" });
+      return res.status(409).json({ error: "Já existe um operador com esse CPF" });
     }
     const passwordHash = await bcrypt.hash(password, 10);
     const [id] = await db("print_operators")
-      .insert({ name, username, password_hash: passwordHash, active: true })
+      .insert({ name, cpf: cpfClean, password_hash: passwordHash, active: true })
       .returning("id");
     const operator = await db("print_operators")
-      .select("id", "name", "username", "active", "created_at")
+      .select("id", "name", "cpf", "active", "created_at")
       .where({ id: typeof id === "object" ? id.id : id })
       .first();
     res.status(201).json(operator);
@@ -917,7 +928,7 @@ router.post("/print-farm/operators", requireAdmin, async (req, res) => {
   }
 });
 
-router.put("/print-farm/operators/:id", requireAdmin, async (req, res) => {
+router.put("/print-farm/operators/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { name, active, password } = req.body;
     const fields = {};
@@ -931,7 +942,7 @@ router.put("/print-farm/operators/:id", requireAdmin, async (req, res) => {
     }
     await db("print_operators").where({ id: req.params.id }).update(fields);
     const operator = await db("print_operators")
-      .select("id", "name", "username", "active", "created_at")
+      .select("id", "name", "cpf", "active", "created_at")
       .where({ id: req.params.id })
       .first();
     if (!operator) return res.status(404).json({ error: "Operador não encontrado" });
@@ -942,7 +953,7 @@ router.put("/print-farm/operators/:id", requireAdmin, async (req, res) => {
   }
 });
 
-router.delete("/print-farm/operators/:id", requireAdmin, async (req, res) => {
+router.delete("/print-farm/operators/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
     await db("print_operators").where({ id: req.params.id }).del();
     res.json({ ok: true });
