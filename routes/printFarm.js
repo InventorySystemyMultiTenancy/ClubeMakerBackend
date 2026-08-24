@@ -28,6 +28,10 @@ const dbConfig = process.env.DATABASE_URL
 const db = knex(dbConfig);
 const JWT_SECRET = process.env.JWT_SECRET;
 
+// Parser próprio: este router é montado antes de app.use(express.json()) no
+// server.js, então não pode depender da ordem de middlewares globais.
+router.use(express.json({ limit: "10mb" }));
+
 // --- Autenticação (mesmo comportamento de server.js) ---
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
