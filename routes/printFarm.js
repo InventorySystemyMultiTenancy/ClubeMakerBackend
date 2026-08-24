@@ -253,6 +253,31 @@ export async function initPrintFarmTables() {
       table.timestamp("created_at").defaultTo(db.fn.now());
     });
     console.log("✅ Tabela 'print_operators' criada com sucesso");
+  } else {
+    // Migração: a primeira versão criou a tabela com 'username' (NOT NULL) em
+    // vez de 'cpf'. Adiciona a coluna nova e remove a antiga, que travaria
+    // todo INSERT novo por causa da constraint NOT NULL que ninguém mais preenche.
+    const hasCpf = await db.schema.hasColumn("print_operators", "cpf");
+    if (!hasCpf) {
+      await db.schema.table("print_operators", (table) => {
+        table.string("cpf", 11);
+      });
+      console.log("✅ Coluna 'cpf' adicionada à tabela print_operators");
+    }
+    const hasUsername = await db.schema.hasColumn("print_operators", "username");
+    if (hasUsername) {
+      try {
+        await db.schema.table("print_operators", (table) => {
+          table.dropColumn("username");
+        });
+        console.log("✅ Coluna 'username' removida de print_operators");
+      } catch (e) {
+        console.warn(
+          "⚠️ Não foi possível remover a coluna 'username' de print_operators (limitação do banco):",
+          e.message,
+        );
+      }
+    }
   }
 }
 
