@@ -19,6 +19,7 @@ import paymentRoutes from "./routes/payment.js";
 import * as paymentService from "./services/paymentService.js";
 import PDFDocument from "pdfkit";
 import superAdminRoutes from "./routes/superadmin.js";
+import printFarmRoutes, { initPrintFarmTables } from "./routes/printFarm.js";
 import { v2 as cloudinary } from "cloudinary";
 
 // Corrige importação para compatibilidade CommonJS/ESM
@@ -70,6 +71,9 @@ app.use(
 
 // Centraliza as rotas de Super Admin
 app.use("/api", superAdminRoutes);
+
+// Rotas do módulo de gestão da frota de impressoras 3D
+app.use("/api", printFarmRoutes);
 
 // Endpoint: contagem de pedidos dos últimos 30 dias
 app.get("/api/orders/last30days-count", async (req, res) => {
@@ -6538,7 +6542,7 @@ app.post("/api/point/configure", (req, res) => {
 
 // --- Inicialização ---
 console.log("🚀 Iniciando servidor...");
-Promise.all([initDatabase(), initRedis()])
+Promise.all([initDatabase(), initRedis(), initPrintFarmTables()])
   .then(() => {
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`✅ Servidor rodando na porta ${PORT}`);
