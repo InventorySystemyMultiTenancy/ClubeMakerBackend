@@ -84,11 +84,13 @@ router.post("/print-farm/operators/login", jsonParser, async (req, res) => {
     if (cpfClean.length !== 11) {
       return res.status(400).json({ error: "CPF inválido. Digite 11 dígitos." });
     }
-    const operator = await db("print_operators").where({ cpf: cpfClean }).first();
-    if (!operator || !operator.active) {
+    const user = await db("users").where({ cpf: cpfClean, role: "print_operator" }).first();
+    // SQLite guarda boolean como 0/1 (não true/false), então checa com !user.active
+    // em vez de === false para funcionar igual em pg e sqlite3.
+    if (!user || !user.active) {
       return res.status(401).json({ error: "CPF ou senha inválidos" });
     }
-    const ok = await bcrypt.compare(password, operator.password_hash);
+    const ok = await bcrypt.compare(password, user.password || "");
     if (!ok) {
       return res.status(401).json({ error: "CPF ou senha inválidos" });
     }
@@ -97,11 +99,11 @@ router.post("/print-farm/operators/login", jsonParser, async (req, res) => {
       return res.status(500).json({ error: "Erro de configuração no servidor." });
     }
     const token = jwt.sign(
-      { role: "print_operator", operatorId: operator.id, operatorName: operator.name },
+      { role: "print_operator", userId: user.id, operatorName: user.name },
       JWT_SECRET,
       { expiresIn: "8h" },
     );
-    res.json({ success: true, token, operator: { id: operator.id, name: operator.name } });
+    res.json({ success: true, token, operator: { id: user.id, name: user.name } });
   } catch (e) {
     console.error("Erro no login do operador:", e);
     res.status(500).json({ error: "Erro ao autenticar operador" });
@@ -116,6 +118,40 @@ router.post("/print-farm/operators/login", jsonParser, async (req, res) => {
 
 // ========== CRIAÇÃO DE TABELAS ==========
 export async function initPrintFarmTables() {
+  // Operadores são usuários de verdade (tabela 'users', role 'print_operator'),
+  // com cadastro completo — não um cadastro simplificado à parte. As colunas
+  // abaixo já existem em produção (usadas por /api/users/register), mas nem
+  // todas são criadas em initDatabase(); garante que existam antes de usá-las.
+  //
+  // initDatabase() (server.js) e initPrintFarmTables() (aqui) rodam em paralelo
+  // via Promise.all — em produção 'users' já existe (dados reais), mas numa
+  // instalação nova a tabela pode ainda não ter sido criada nesse instante.
+  // Sem esse hasTable(), um ALTER TABLE aqui derrubaria o boot inteiro.
+  if (await db.schema.hasTable("users")) {
+    const userColumns = [
+      { name: "password", type: "string" },
+      { name: "cep", type: "string" },
+      { name: "address", type: "string" },
+      { name: "phone", type: "string" },
+      { name: "role", type: "string" },
+      { name: "active", type: "boolean", default: true },
+    ];
+    for (const col of userColumns) {
+      const hasCol = await db.schema.hasColumn("users", col.name);
+      if (!hasCol) {
+        await db.schema.table("users", (table) => {
+          if (col.type === "string") table.string(col.name);
+          if (col.type === "boolean") table.boolean(col.name).defaultTo(col.default);
+        });
+        console.log(`✅ Coluna '${col.name}' adicionada à tabela users`);
+      }
+    }
+  } else {
+    console.warn(
+      "⚠️ Tabela 'users' ainda não existe — migração de colunas para operadores será tentada na próxima subida do servidor.",
+    );
+  }
+
   if (!(await db.schema.hasTable("printers"))) {
     await db.schema.createTable("printers", (table) => {
       table.increments("id").primary();
@@ -214,9 +250,12 @@ export async function initPrintFarmTables() {
       table.decimal("loss_cost", 10, 2);
       table.decimal("revenue_value", 10, 2);
       table.string("created_by_role");
-      table.integer("started_by_operator_id");
+      // Identificação do operador (users.id, string) que iniciou/finalizou a chapa.
+      // O nome fica desnormalizado aqui para o relatório não depender de um JOIN
+      // com 'users' nem quebrar se o funcionário for removido depois.
+      table.string("started_by_user_id");
       table.string("started_by_operator_name");
-      table.integer("finished_by_operator_id");
+      table.string("finished_by_user_id");
       table.string("finished_by_operator_name");
       table.timestamp("created_at").defaultTo(db.fn.now());
       table.index(["printer_id"]);
@@ -226,56 +265,18 @@ export async function initPrintFarmTables() {
   } else {
     // Migração aditiva: adiciona colunas de rastreio de operador em bancos já existentes
     const operatorColumns = [
-      { name: "started_by_operator_id", type: "integer" },
+      { name: "started_by_user_id", type: "string" },
       { name: "started_by_operator_name", type: "string" },
-      { name: "finished_by_operator_id", type: "integer" },
+      { name: "finished_by_user_id", type: "string" },
       { name: "finished_by_operator_name", type: "string" },
     ];
     for (const col of operatorColumns) {
       const hasCol = await db.schema.hasColumn("print_jobs", col.name);
       if (!hasCol) {
         await db.schema.table("print_jobs", (table) => {
-          if (col.type === "integer") table.integer(col.name);
-          if (col.type === "string") table.string(col.name);
+          table.string(col.name);
         });
         console.log(`✅ Coluna '${col.name}' adicionada à tabela print_jobs`);
-      }
-    }
-  }
-
-  if (!(await db.schema.hasTable("print_operators"))) {
-    await db.schema.createTable("print_operators", (table) => {
-      table.increments("id").primary();
-      table.string("name").notNullable();
-      table.string("cpf", 11).notNullable().unique();
-      table.string("password_hash").notNullable();
-      table.boolean("active").notNullable().defaultTo(true);
-      table.timestamp("created_at").defaultTo(db.fn.now());
-    });
-    console.log("✅ Tabela 'print_operators' criada com sucesso");
-  } else {
-    // Migração: a primeira versão criou a tabela com 'username' (NOT NULL) em
-    // vez de 'cpf'. Adiciona a coluna nova e remove a antiga, que travaria
-    // todo INSERT novo por causa da constraint NOT NULL que ninguém mais preenche.
-    const hasCpf = await db.schema.hasColumn("print_operators", "cpf");
-    if (!hasCpf) {
-      await db.schema.table("print_operators", (table) => {
-        table.string("cpf", 11);
-      });
-      console.log("✅ Coluna 'cpf' adicionada à tabela print_operators");
-    }
-    const hasUsername = await db.schema.hasColumn("print_operators", "username");
-    if (hasUsername) {
-      try {
-        await db.schema.table("print_operators", (table) => {
-          table.dropColumn("username");
-        });
-        console.log("✅ Coluna 'username' removida de print_operators");
-      } catch (e) {
-        console.warn(
-          "⚠️ Não foi possível remover a coluna 'username' de print_operators (limitação do banco):",
-          e.message,
-        );
       }
     }
   }
@@ -624,8 +625,8 @@ router.get("/print-jobs", jsonParser, authenticateToken, requireAdmin, async (re
     if (req.query.printer_id) query = query.where("pj.printer_id", req.query.printer_id);
     if (req.query.operator_id) {
       query = query.where(function () {
-        this.where("pj.started_by_operator_id", req.query.operator_id).orWhere(
-          "pj.finished_by_operator_id",
+        this.where("pj.started_by_user_id", req.query.operator_id).orWhere(
+          "pj.finished_by_user_id",
           req.query.operator_id,
         );
       });
@@ -717,7 +718,7 @@ router.post("/print-jobs/start", jsonParser, authenticateToken, requireAdminOrOp
         estimated_end_at: estimatedEndAt,
         status: "running",
         created_by_role: req.user.role,
-        started_by_operator_id: req.user.role === "print_operator" ? req.user.operatorId : null,
+        started_by_user_id: req.user.role === "print_operator" ? req.user.userId : null,
         started_by_operator_name:
           req.user.role === "print_operator" ? req.user.operatorName : "Admin",
       })
@@ -774,7 +775,7 @@ router.post("/print-jobs/:id/finish", jsonParser, authenticateToken, requireAdmi
         loss_cost: lossCost,
         revenue_value: revenueValue,
         status: "completed",
-        finished_by_operator_id: req.user.role === "print_operator" ? req.user.operatorId : null,
+        finished_by_user_id: req.user.role === "print_operator" ? req.user.userId : null,
         finished_by_operator_name:
           req.user.role === "print_operator" ? req.user.operatorName : "Admin",
       });
@@ -861,7 +862,7 @@ router.get("/print-farm/summary", jsonParser, authenticateToken, requireAdmin, a
 
       // Responsável pela chapa: quem finalizou (decide sucesso/falha); se não houver
       // (finalizado por admin sem conta de operador), cai para quem iniciou.
-      const operatorId = job.finished_by_operator_id ?? job.started_by_operator_id ?? null;
+      const operatorId = job.finished_by_user_id ?? job.started_by_user_id ?? null;
       const operatorName =
         job.finished_by_operator_name || job.started_by_operator_name || "Admin";
       const operatorKey = operatorId !== null ? `op_${operatorId}` : `role_${operatorName}`;
@@ -909,10 +910,16 @@ router.get("/print-farm/summary", jsonParser, authenticateToken, requireAdmin, a
 });
 
 // ========== OPERADORES (funcionários que ligam/desligam impressoras) ==========
+// São usuários de verdade (tabela 'users', role 'print_operator'), com cadastro
+// completo — não uma conta simplificada à parte. Isso é o que permite, se um dia
+// fizer sentido, o mesmo funcionário também comprar como cliente com a mesma conta.
+const OPERATOR_FIELDS = ["id", "name", "cpf", "email", "cep", "address", "phone", "active"];
+
 router.get("/print-farm/operators", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const operators = await db("print_operators")
-      .select("id", "name", "cpf", "active", "created_at")
+    const operators = await db("users")
+      .where({ role: "print_operator" })
+      .select(OPERATOR_FIELDS)
       .orderBy("name");
     res.json(operators);
   } catch (e) {
@@ -923,9 +930,11 @@ router.get("/print-farm/operators", jsonParser, authenticateToken, requireAdmin,
 
 router.post("/print-farm/operators", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, cpf, password } = req.body;
-    if (!name || !cpf || !password) {
-      return res.status(400).json({ error: "Nome, CPF e senha são obrigatórios" });
+    const { name, cpf, email, cep, address, phone, password } = req.body;
+    if (!name || !cpf || !email || !cep || !address || !phone || !password) {
+      return res.status(400).json({
+        error: "Nome, CPF, e-mail, CEP, endereço, telefone e senha são obrigatórios",
+      });
     }
     const cpfClean = String(cpf).replace(/\D/g, "");
     if (cpfClean.length !== 11) {
@@ -934,18 +943,27 @@ router.post("/print-farm/operators", jsonParser, authenticateToken, requireAdmin
     if (password.length < 4) {
       return res.status(400).json({ error: "Senha deve ter pelo menos 4 caracteres" });
     }
-    const existing = await db("print_operators").where({ cpf: cpfClean }).first();
+    const existing = await db("users").where({ cpf: cpfClean }).first();
     if (existing) {
-      return res.status(409).json({ error: "Já existe um operador com esse CPF" });
+      return res.status(409).json({ error: "Já existe um usuário cadastrado com esse CPF" });
     }
     const passwordHash = await bcrypt.hash(password, 10);
-    const [id] = await db("print_operators")
-      .insert({ name, cpf: cpfClean, password_hash: passwordHash, active: true })
-      .returning("id");
-    const operator = await db("print_operators")
-      .select("id", "name", "cpf", "active", "created_at")
-      .where({ id: typeof id === "object" ? id.id : id })
-      .first();
+    const id = `user_${Date.now()}`;
+    await db("users").insert({
+      id,
+      name,
+      cpf: cpfClean,
+      email,
+      cep,
+      address,
+      phone,
+      password: passwordHash,
+      role: "print_operator",
+      active: true,
+      historico: JSON.stringify([]),
+      pontos: 0,
+    });
+    const operator = await db("users").select(OPERATOR_FIELDS).where({ id }).first();
     res.status(201).json(operator);
   } catch (e) {
     console.error("Erro ao criar operador:", e);
@@ -955,20 +973,24 @@ router.post("/print-farm/operators", jsonParser, authenticateToken, requireAdmin
 
 router.put("/print-farm/operators/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, active, password } = req.body;
+    const { name, email, cep, address, phone, active, password } = req.body;
     const fields = {};
     if (name !== undefined) fields.name = name;
+    if (email !== undefined) fields.email = email;
+    if (cep !== undefined) fields.cep = cep;
+    if (address !== undefined) fields.address = address;
+    if (phone !== undefined) fields.phone = phone;
     if (active !== undefined) fields.active = active;
     if (password) {
       if (password.length < 4) {
         return res.status(400).json({ error: "Senha deve ter pelo menos 4 caracteres" });
       }
-      fields.password_hash = await bcrypt.hash(password, 10);
+      fields.password = await bcrypt.hash(password, 10);
     }
-    await db("print_operators").where({ id: req.params.id }).update(fields);
-    const operator = await db("print_operators")
-      .select("id", "name", "cpf", "active", "created_at")
-      .where({ id: req.params.id })
+    await db("users").where({ id: req.params.id, role: "print_operator" }).update(fields);
+    const operator = await db("users")
+      .select(OPERATOR_FIELDS)
+      .where({ id: req.params.id, role: "print_operator" })
       .first();
     if (!operator) return res.status(404).json({ error: "Operador não encontrado" });
     res.json(operator);
@@ -980,7 +1002,9 @@ router.put("/print-farm/operators/:id", jsonParser, authenticateToken, requireAd
 
 router.delete("/print-farm/operators/:id", jsonParser, authenticateToken, requireAdmin, async (req, res) => {
   try {
-    await db("print_operators").where({ id: req.params.id }).del();
+    // Escopado a role 'print_operator' de propósito: essa rota nunca pode apagar
+    // um cliente de verdade, mesmo que alguém passe um id errado.
+    await db("users").where({ id: req.params.id, role: "print_operator" }).del();
     res.json({ ok: true });
   } catch (e) {
     console.error("Erro ao remover operador:", e);
