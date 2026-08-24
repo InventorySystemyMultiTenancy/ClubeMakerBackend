@@ -222,6 +222,53 @@ export async function initPrintFarmTables() {
     console.log("✅ Tabela 'print_products' criada com sucesso");
   }
 
+  // Um produto pode usar mais de um filamento na mesma chapa (ex: peça em duas
+  // cores). filament_id/filament_grams_per_plate em print_products ficam como
+  // campos legados (não usados mais na criação/edição, só não quebram bancos antigos).
+  if (!(await db.schema.hasTable("print_product_filaments"))) {
+    await db.schema.createTable("print_product_filaments", (table) => {
+      table.increments("id").primary();
+      table
+        .integer("print_product_id")
+        .notNullable()
+        .references("id")
+        .inTable("print_products")
+        .onDelete("CASCADE");
+      table
+        .integer("filament_id")
+        .notNullable()
+        .references("id")
+        .inTable("filaments")
+        .onDelete("CASCADE");
+      table.decimal("grams_per_plate", 10, 2).notNullable().defaultTo(0);
+      table.index(["print_product_id"]);
+    });
+    console.log("✅ Tabela 'print_product_filaments' criada com sucesso");
+  }
+
+  // Migração: perfis cadastrados antes desta mudança (um filamento só, em
+  // print_products.filament_id) ganham a linha correspondente na tabela nova,
+  // pra não perder o vínculo quando passam a poder ter vários filamentos.
+  const legacyProducts = await db("print_products")
+    .whereNotNull("filament_id")
+    .whereNotExists(function () {
+      this.select("*")
+        .from("print_product_filaments")
+        .whereRaw("print_product_filaments.print_product_id = print_products.id");
+    });
+  for (const p of legacyProducts) {
+    await db("print_product_filaments").insert({
+      print_product_id: p.id,
+      filament_id: p.filament_id,
+      grams_per_plate: p.filament_grams_per_plate || 0,
+    });
+  }
+  if (legacyProducts.length > 0) {
+    console.log(
+      `✅ ${legacyProducts.length} perfil(is) migrado(s) do esquema antigo (1 filamento) para a lista nova`,
+    );
+  }
+
   if (!(await db.schema.hasTable("print_jobs"))) {
     await db.schema.createTable("print_jobs", (table) => {
       table.increments("id").primary();
@@ -279,6 +326,30 @@ export async function initPrintFarmTables() {
         console.log(`✅ Coluna '${col.name}' adicionada à tabela print_jobs`);
       }
     }
+  }
+
+  // Snapshot de cada filamento usado num job (um job pode ter vários, espelhando
+  // o perfil de produto no momento em que a produção foi iniciada). material/color
+  // ficam desnormalizados para o histórico não sumir se o filamento for removido depois.
+  if (!(await db.schema.hasTable("print_job_filaments"))) {
+    await db.schema.createTable("print_job_filaments", (table) => {
+      table.increments("id").primary();
+      table
+        .integer("print_job_id")
+        .notNullable()
+        .references("id")
+        .inTable("print_jobs")
+        .onDelete("CASCADE");
+      table.integer("filament_id");
+      table.string("filament_material");
+      table.string("filament_color");
+      table.decimal("grams_per_plate_snapshot", 10, 2).notNullable().defaultTo(0);
+      table.decimal("cost_per_kg_snapshot", 10, 2).notNullable().defaultTo(0);
+      table.decimal("loss_grams", 10, 2);
+      table.decimal("loss_cost", 10, 2);
+      table.index(["print_job_id"]);
+    });
+    console.log("✅ Tabela 'print_job_filaments' criada com sucesso");
   }
 }
 
@@ -510,18 +581,51 @@ router.delete("/filaments/:id", jsonParser, authenticateToken, requireAdmin, asy
 });
 
 // ========== PRINT PRODUCTS (perfis de impressão) ==========
+// Um perfil pode usar mais de um filamento na mesma chapa (ex: peça em duas
+// cores) — validamos e gravamos como lista em print_product_filaments.
+function validateFilamentsList(filaments) {
+  if (!Array.isArray(filaments) || filaments.length === 0) {
+    return "Informe ao menos um filamento";
+  }
+  for (const f of filaments) {
+    if (!f || !f.filament_id || Number(f.grams_per_plate) < 0) {
+      return "Cada filamento precisa de um id válido e gramas por chapa (>= 0)";
+    }
+  }
+  return null;
+}
+
+async function attachFilamentsToProducts(products) {
+  if (products.length === 0) return products;
+  const ids = products.map((p) => p.id);
+  const rows = await db("print_product_filaments as ppf")
+    .join("filaments as f", "ppf.filament_id", "f.id")
+    .whereIn("ppf.print_product_id", ids)
+    .select(
+      "ppf.print_product_id",
+      "ppf.filament_id",
+      "ppf.grams_per_plate",
+      "f.material",
+      "f.color",
+      "f.cost_per_kg",
+    );
+  const byProduct = {};
+  for (const row of rows) {
+    (byProduct[row.print_product_id] ||= []).push({
+      filament_id: row.filament_id,
+      material: row.material,
+      color: row.color,
+      cost_per_kg: row.cost_per_kg,
+      grams_per_plate: row.grams_per_plate,
+    });
+  }
+  return products.map((p) => ({ ...p, filaments: byProduct[p.id] || [] }));
+}
+
 router.get("/print-products", jsonParser, authenticateToken, requireAdminOrOperator, async (req, res) => {
   try {
-    const products = await db("print_products as pp")
-      .leftJoin("filaments as f", "pp.filament_id", "f.id")
-      .select(
-        "pp.*",
-        "f.material as filament_material",
-        "f.color as filament_color",
-        "f.cost_per_kg as filament_cost_per_kg",
-      )
-      .orderBy("pp.name");
-    res.json(products);
+    const products = await db("print_products").select("*").orderBy("name");
+    res.json(await attachFilamentsToProducts(products));
   } catch (e) {
     console.error("Erro ao listar perfis de produto:", e);
     res.status(500).json({ error: "Erro ao listar perfis de produto" });
@@ -536,8 +640,7 @@ router.post("/print-products", jsonParser, authenticateToken, requireAdmin, asyn
       size_variant,
       units_per_plate,
       estimated_time_minutes,
-      filament_id,
-      filament_grams_per_plate,
+      filaments,
       manual_unit_price,
     } = req.body;
     if (!name || !units_per_plate || !estimated_time_minutes) {
@@ -545,22 +648,32 @@ router.post("/print-products", jsonParser, authenticateToken, requireAdmin, asyn
         error: "Nome, quantidade por chapa e tempo estimado são obrigatórios",
       });
     }
-    const [id] = await db("print_products")
-      .insert({
-        name,
-        product_id: product_id || null,
-        size_variant,
-        units_per_plate,
-        estimated_time_minutes,
-        filament_id: filament_id || null,
-        filament_grams_per_plate: filament_grams_per_plate || 0,
-        manual_unit_price: manual_unit_price || null,
-      })
-      .returning("id");
-    const product = await db("print_products")
-      .where({ id: typeof id === "object" ? id.id : id })
-      .first();
-    res.status(201).json(product);
+    const filamentsError = validateFilamentsList(filaments);
+    if (filamentsError) return res.status(400).json({ error: filamentsError });
+
+    const product = await db.transaction(async (trx) => {
+      const [id] = await trx("print_products")
+        .insert({
+          name,
+          product_id: product_id || null,
+          size_variant,
+          units_per_plate,
+          estimated_time_minutes,
+          manual_unit_price: manual_unit_price || null,
+        })
+        .returning("id");
+      const productId = typeof id === "object" ? id.id : id;
+      await trx("print_product_filaments").insert(
+        filaments.map((f) => ({
+          print_product_id: productId,
+          filament_id: f.filament_id,
+          grams_per_plate: f.grams_per_plate || 0,
+        })),
+      );
+      return trx("print_products").where({ id: productId }).first();
+    });
+    const [withFilaments] = await attachFilamentsToProducts([product]);
+    res.status(201).json(withFilaments);
   } catch (e) {
     console.error("Erro ao criar perfil de produto:", e);
     res.status(500).json({ error: "Erro ao criar perfil de produto" });
@@ -575,23 +688,42 @@ router.put("/print-products/:id", jsonParser, authenticateToken, requireAdmin, a
       size_variant,
       units_per_plate,
       estimated_time_minutes,
-      filament_id,
-      filament_grams_per_plate,
+      filaments,
       manual_unit_price,
     } = req.body;
+
+    if (filaments !== undefined) {
+      const filamentsError = validateFilamentsList(filaments);
+      if (filamentsError) return res.status(400).json({ error: filamentsError });
+    }
+
     const fields = {};
     if (name !== undefined) fields.name = name;
     if (product_id !== undefined) fields.product_id = product_id || null;
     if (size_variant !== undefined) fields.size_variant = size_variant;
     if (units_per_plate !== undefined) fields.units_per_plate = units_per_plate;
     if (estimated_time_minutes !== undefined) fields.estimated_time_minutes = estimated_time_minutes;
-    if (filament_id !== undefined) fields.filament_id = filament_id || null;
-    if (filament_grams_per_plate !== undefined) fields.filament_grams_per_plate = filament_grams_per_plate;
     if (manual_unit_price !== undefined) fields.manual_unit_price = manual_unit_price || null;
-    await db("print_products").where({ id: req.params.id }).update(fields);
-    const product = await db("print_products").where({ id: req.params.id }).first();
+
+    const product = await db.transaction(async (trx) => {
+      if (Object.keys(fields).length > 0) {
+        await trx("print_products").where({ id: req.params.id }).update(fields);
+      }
+      if (filaments !== undefined) {
+        await trx("print_product_filaments").where({ print_product_id: req.params.id }).del();
+        await trx("print_product_filaments").insert(
+          filaments.map((f) => ({
+            print_product_id: req.params.id,
+            filament_id: f.filament_id,
+            grams_per_plate: f.grams_per_plate || 0,
+          })),
+        );
+      }
+      return trx("print_products").where({ id: req.params.id }).first();
+    });
     if (!product) return res.status(404).json({ error: "Perfil de produto não encontrado" });
-    res.json(product);
+    const [withFilaments] = await attachFilamentsToProducts([product]);
+    res.json(withFilaments);
   } catch (e) {
     console.error("Erro ao atualizar perfil de produto:", e);
     res.status(500).json({ error: "Erro ao atualizar perfil de produto" });
@@ -642,6 +774,28 @@ router.get("/print-jobs", jsonParser, authenticateToken, requireAdmin, async (re
   }
 });
 
+async function attachFilamentsToJobs(jobs) {
+  if (jobs.length === 0) return jobs;
+  const ids = jobs.map((j) => j.id);
+  const rows = await db("print_job_filaments")
+    .whereIn("print_job_id", ids)
+    .select(
+      "print_job_id",
+      "filament_id",
+      "filament_material",
+      "filament_color",
+      "grams_per_plate_snapshot",
+      "cost_per_kg_snapshot",
+      "loss_grams",
+      "loss_cost",
+    );
+  const byJob = {};
+  for (const row of rows) {
+    (byJob[row.print_job_id] ||= []).push(row);
+  }
+  return jobs.map((j) => ({ ...j, filaments: byJob[j.id] || [] }));
+}
+
 // Jobs em andamento/atrasados, com os dados mínimos para o painel operar a frota
 // (não expõe totais de negócio — isso fica em /print-farm/summary, admin-only).
 router.get("/print-farm/active-jobs", jsonParser, authenticateToken, requireAdminOrOperator, async (req, res) => {
@@ -658,15 +812,13 @@ router.get("/print-farm/active-jobs", jsonParser, authenticateToken, requireAdmi
         "pj.started_at",
         "pj.estimated_end_at",
         "pj.status",
-        "pj.filament_grams_per_plate_snapshot",
-        "pj.filament_cost_per_kg_snapshot",
         "pj.unit_sale_price_snapshot",
         "pj.started_by_operator_name",
         "pr.number as printer_number",
         "pr.nickname as printer_nickname",
         "pp.name as product_name",
       );
-    res.json(jobs);
+    res.json(await attachFilamentsToJobs(jobs));
   } catch (e) {
     console.error("Erro ao listar jobs ativos:", e);
     res.status(500).json({ error: "Erro ao listar jobs ativos" });
@@ -691,9 +843,14 @@ router.post("/print-jobs/start", jsonParser, authenticateToken, requireAdminOrOp
     const product = await db("print_products").where({ id: print_product_id }).first();
     if (!product) return res.status(404).json({ error: "Perfil de produto não encontrado" });
 
-    let filament = null;
-    if (product.filament_id) {
-      filament = await db("filaments").where({ id: product.filament_id }).first();
+    const productFilaments = await db("print_product_filaments as ppf")
+      .join("filaments as f", "ppf.filament_id", "f.id")
+      .where("ppf.print_product_id", product.id)
+      .select("ppf.filament_id", "ppf.grams_per_plate", "f.material", "f.color", "f.cost_per_kg");
+    if (productFilaments.length === 0) {
+      return res.status(400).json({
+        error: "Este perfil não tem filamento cadastrado. Edite o perfil antes de iniciar a produção.",
+      });
     }
 
     let unitSalePrice = product.manual_unit_price ? Number(product.manual_unit_price) : null;
@@ -705,31 +862,42 @@ router.post("/print-jobs/start", jsonParser, authenticateToken, requireAdminOrOp
     const startedAt = new Date();
     const estimatedEndAt = new Date(startedAt.getTime() + product.estimated_time_minutes * 60000);
 
-    const [id] = await db("print_jobs")
-      .insert({
-        printer_id,
-        print_product_id,
-        planned_units: product.units_per_plate,
-        filament_id: product.filament_id || null,
-        filament_grams_per_plate_snapshot: product.filament_grams_per_plate,
-        filament_cost_per_kg_snapshot: filament ? filament.cost_per_kg : null,
-        unit_sale_price_snapshot: unitSalePrice,
-        started_at: startedAt,
-        estimated_end_at: estimatedEndAt,
-        status: "running",
-        created_by_role: req.user.role,
-        started_by_user_id: req.user.role === "print_operator" ? req.user.userId : null,
-        started_by_operator_name:
-          req.user.role === "print_operator" ? req.user.operatorName : "Admin",
-      })
-      .returning("id");
+    const job = await db.transaction(async (trx) => {
+      const [id] = await trx("print_jobs")
+        .insert({
+          printer_id,
+          print_product_id,
+          planned_units: product.units_per_plate,
+          unit_sale_price_snapshot: unitSalePrice,
+          started_at: startedAt,
+          estimated_end_at: estimatedEndAt,
+          status: "running",
+          created_by_role: req.user.role,
+          started_by_user_id: req.user.role === "print_operator" ? req.user.userId : null,
+          started_by_operator_name:
+            req.user.role === "print_operator" ? req.user.operatorName : "Admin",
+        })
+        .returning("id");
+      const jobId = typeof id === "object" ? id.id : id;
 
-    await db("printers").where({ id: printer_id }).update({ status: "running" });
+      await trx("print_job_filaments").insert(
+        productFilaments.map((pf) => ({
+          print_job_id: jobId,
+          filament_id: pf.filament_id,
+          filament_material: pf.material,
+          filament_color: pf.color,
+          grams_per_plate_snapshot: pf.grams_per_plate,
+          cost_per_kg_snapshot: pf.cost_per_kg,
+        })),
+      );
 
-    const job = await db("print_jobs")
-      .where({ id: typeof id === "object" ? id.id : id })
-      .first();
-    res.status(201).json(job);
+      await trx("printers").where({ id: printer_id }).update({ status: "running" });
+
+      return trx("print_jobs").where({ id: jobId }).first();
+    });
+
+    const [withFilaments] = await attachFilamentsToJobs([job]);
+    res.status(201).json(withFilaments);
   } catch (e) {
     console.error("Erro ao iniciar produção:", e);
     res.status(500).json({ error: "Erro ao iniciar produção" });
@@ -754,46 +922,58 @@ router.post("/print-jobs/:id/finish", jsonParser, authenticateToken, requireAdmi
     }
 
     const finishedAt = new Date();
-    const gramsPerPlate = Number(job.filament_grams_per_plate_snapshot || 0);
-    const costPerKg = Number(job.filament_cost_per_kg_snapshot || 0);
     const unitPrice = job.unit_sale_price_snapshot !== null ? Number(job.unit_sale_price_snapshot) : null;
-
-    const lossGrams = job.planned_units > 0
-      ? gramsPerPlate * (Number(fail_count) / job.planned_units)
-      : 0;
-    const lossCost = (lossGrams / 1000) * costPerKg;
     const revenueValue = unitPrice !== null ? Number(success_count) * unitPrice : null;
     const durationHours = (finishedAt.getTime() - new Date(job.started_at).getTime()) / 3600000;
 
-    await db("print_jobs")
-      .where({ id: req.params.id })
-      .update({
-        finished_at: finishedAt,
-        success_count,
-        fail_count,
-        loss_filament_grams: lossGrams,
-        loss_cost: lossCost,
-        revenue_value: revenueValue,
-        status: "completed",
-        finished_by_user_id: req.user.role === "print_operator" ? req.user.userId : null,
-        finished_by_operator_name:
-          req.user.role === "print_operator" ? req.user.operatorName : "Admin",
-      });
+    const jobFilaments = await db("print_job_filaments").where({ print_job_id: job.id });
+    let totalLossGrams = 0;
+    let totalLossCost = 0;
 
-    await db("printers")
-      .where({ id: job.printer_id })
-      .increment("total_print_count", 1)
-      .increment("total_print_hours", durationHours)
-      .update({ status: "idle" });
+    await db.transaction(async (trx) => {
+      for (const jf of jobFilaments) {
+        const gramsPerPlate = Number(jf.grams_per_plate_snapshot || 0);
+        const costPerKg = Number(jf.cost_per_kg_snapshot || 0);
+        const lossGrams =
+          job.planned_units > 0 ? gramsPerPlate * (Number(fail_count) / job.planned_units) : 0;
+        const lossCost = (lossGrams / 1000) * costPerKg;
+        totalLossGrams += lossGrams;
+        totalLossCost += lossCost;
 
-    if (job.filament_id && gramsPerPlate > 0) {
-      await db("filaments")
-        .where({ id: job.filament_id })
-        .decrement("stock_grams", gramsPerPlate);
-    }
+        await trx("print_job_filaments").where({ id: jf.id }).update({
+          loss_grams: lossGrams,
+          loss_cost: lossCost,
+        });
+        if (jf.filament_id && gramsPerPlate > 0) {
+          await trx("filaments").where({ id: jf.filament_id }).decrement("stock_grams", gramsPerPlate);
+        }
+      }
+
+      await trx("print_jobs")
+        .where({ id: req.params.id })
+        .update({
+          finished_at: finishedAt,
+          success_count,
+          fail_count,
+          loss_filament_grams: totalLossGrams,
+          loss_cost: totalLossCost,
+          revenue_value: revenueValue,
+          status: "completed",
+          finished_by_user_id: req.user.role === "print_operator" ? req.user.userId : null,
+          finished_by_operator_name:
+            req.user.role === "print_operator" ? req.user.operatorName : "Admin",
+        });
+
+      await trx("printers")
+        .where({ id: job.printer_id })
+        .increment("total_print_count", 1)
+        .increment("total_print_hours", durationHours)
+        .update({ status: "idle" });
+    });
 
     const updated = await db("print_jobs").where({ id: req.params.id }).first();
-    res.json(updated);
+    const [withFilaments] = await attachFilamentsToJobs([updated]);
+    res.json(withFilaments);
   } catch (e) {
     console.error("Erro ao finalizar produção:", e);
     res.status(500).json({ error: "Erro ao finalizar produção" });
