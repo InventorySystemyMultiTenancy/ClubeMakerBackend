@@ -4,6 +4,7 @@
 import express from "express";
 import knex from "knex";
 import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 import path from "path";
 
 const router = express.Router();
@@ -50,7 +51,7 @@ function authenticateToken(req, res, next) {
   });
 }
 
-function authorizeAdmin(req, res, next) {
+function requireAdmin(req, res, next) {
   if (req.user.role !== "admin") {
     return res
       .status(403)
@@ -59,12 +60,50 @@ function authorizeAdmin(req, res, next) {
   next();
 }
 
-router.use("/printers", authenticateToken, authorizeAdmin);
-router.use("/printer-parts", authenticateToken, authorizeAdmin);
-router.use("/filaments", authenticateToken, authorizeAdmin);
-router.use("/print-products", authenticateToken, authorizeAdmin);
-router.use("/print-jobs", authenticateToken, authorizeAdmin);
-router.use("/print-farm", authenticateToken, authorizeAdmin);
+// Operadores só podem ver a frota/catálogo e iniciar/finalizar produções.
+// Gestão de cadastros (impressoras, peças, filamentos, perfis, operadores) e relatórios são admin-only.
+function requireAdminOrOperator(req, res, next) {
+  if (req.user.role !== "admin" && req.user.role !== "print_operator") {
+    return res.status(403).json({ error: "Acesso negado." });
+  }
+  next();
+}
+
+// ========== LOGIN DO OPERADOR (público — precisa vir antes do authenticateToken) ==========
+router.post("/print-farm/operators/login", async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ error: "Usuário e senha são obrigatórios" });
+    }
+    const operator = await db("print_operators")
+      .whereRaw("lower(username) = ?", [String(username).toLowerCase()])
+      .first();
+    if (!operator || !operator.active) {
+      return res.status(401).json({ error: "Usuário ou senha inválidos" });
+    }
+    const ok = await bcrypt.compare(password, operator.password_hash);
+    if (!ok) {
+      return res.status(401).json({ error: "Usuário ou senha inválidos" });
+    }
+    if (!JWT_SECRET) {
+      console.error("🚨 JWT_SECRET não está configurado!");
+      return res.status(500).json({ error: "Erro de configuração no servidor." });
+    }
+    const token = jwt.sign(
+      { role: "print_operator", operatorId: operator.id, operatorName: operator.name },
+      JWT_SECRET,
+      { expiresIn: "8h" },
+    );
+    res.json({ success: true, token, operator: { id: operator.id, name: operator.name } });
+  } catch (e) {
+    console.error("Erro no login do operador:", e);
+    res.status(500).json({ error: "Erro ao autenticar operador" });
+  }
+});
+
+// Tudo abaixo desta linha exige um token válido (admin OU operador, conforme a rota)
+router.use(authenticateToken);
 
 // ========== CRIAÇÃO DE TABELAS ==========
 export async function initPrintFarmTables() {
@@ -166,16 +205,50 @@ export async function initPrintFarmTables() {
       table.decimal("loss_cost", 10, 2);
       table.decimal("revenue_value", 10, 2);
       table.string("created_by_role");
+      table.integer("started_by_operator_id");
+      table.string("started_by_operator_name");
+      table.integer("finished_by_operator_id");
+      table.string("finished_by_operator_name");
       table.timestamp("created_at").defaultTo(db.fn.now());
       table.index(["printer_id"]);
       table.index(["status"]);
     });
     console.log("✅ Tabela 'print_jobs' criada com sucesso");
+  } else {
+    // Migração aditiva: adiciona colunas de rastreio de operador em bancos já existentes
+    const operatorColumns = [
+      { name: "started_by_operator_id", type: "integer" },
+      { name: "started_by_operator_name", type: "string" },
+      { name: "finished_by_operator_id", type: "integer" },
+      { name: "finished_by_operator_name", type: "string" },
+    ];
+    for (const col of operatorColumns) {
+      const hasCol = await db.schema.hasColumn("print_jobs", col.name);
+      if (!hasCol) {
+        await db.schema.table("print_jobs", (table) => {
+          if (col.type === "integer") table.integer(col.name);
+          if (col.type === "string") table.string(col.name);
+        });
+        console.log(`✅ Coluna '${col.name}' adicionada à tabela print_jobs`);
+      }
+    }
+  }
+
+  if (!(await db.schema.hasTable("print_operators"))) {
+    await db.schema.createTable("print_operators", (table) => {
+      table.increments("id").primary();
+      table.string("name").notNullable();
+      table.string("username").notNullable().unique();
+      table.string("password_hash").notNullable();
+      table.boolean("active").notNullable().defaultTo(true);
+      table.timestamp("created_at").defaultTo(db.fn.now());
+    });
+    console.log("✅ Tabela 'print_operators' criada com sucesso");
   }
 }
 
 // ========== PRINTERS ==========
-router.get("/printers", async (req, res) => {
+router.get("/printers", requireAdminOrOperator, async (req, res) => {
   try {
     const printers = await db("printers").select("*").orderBy("number");
     res.json(printers);
@@ -185,7 +258,7 @@ router.get("/printers", async (req, res) => {
   }
 });
 
-router.post("/printers", async (req, res) => {
+router.post("/printers", requireAdmin, async (req, res) => {
   try {
     const { number, nickname, brand, model, purchase_date, notes } = req.body;
     if (!number) {
@@ -208,7 +281,7 @@ router.post("/printers", async (req, res) => {
   }
 });
 
-router.put("/printers/:id", async (req, res) => {
+router.put("/printers/:id", requireAdmin, async (req, res) => {
   try {
     const { nickname, brand, model, purchase_date, notes, status } = req.body;
     const fields = {};
@@ -239,7 +312,7 @@ router.put("/printers/:id", async (req, res) => {
   }
 });
 
-router.delete("/printers/:id", async (req, res) => {
+router.delete("/printers/:id", requireAdmin, async (req, res) => {
   try {
     const printer = await db("printers").where({ id: req.params.id }).first();
     if (!printer) return res.status(404).json({ error: "Impressora não encontrada" });
@@ -255,7 +328,7 @@ router.delete("/printers/:id", async (req, res) => {
 });
 
 // ========== PRINTER PARTS (manutenção) ==========
-router.get("/printers/:id/parts", async (req, res) => {
+router.get("/printers/:id/parts", requireAdmin, async (req, res) => {
   try {
     const parts = await db("printer_parts")
       .where({ printer_id: req.params.id })
@@ -267,7 +340,7 @@ router.get("/printers/:id/parts", async (req, res) => {
   }
 });
 
-router.post("/printers/:id/parts", async (req, res) => {
+router.post("/printers/:id/parts", requireAdmin, async (req, res) => {
   try {
     const printer = await db("printers").where({ id: req.params.id }).first();
     if (!printer) return res.status(404).json({ error: "Impressora não encontrada" });
@@ -296,7 +369,7 @@ router.post("/printers/:id/parts", async (req, res) => {
   }
 });
 
-router.put("/printer-parts/:id", async (req, res) => {
+router.put("/printer-parts/:id", requireAdmin, async (req, res) => {
   try {
     const { part_type, lifespan_prints, replacement_cost } = req.body;
     const fields = {};
@@ -313,7 +386,7 @@ router.put("/printer-parts/:id", async (req, res) => {
   }
 });
 
-router.post("/printer-parts/:id/replace", async (req, res) => {
+router.post("/printer-parts/:id/replace", requireAdmin, async (req, res) => {
   try {
     const part = await db("printer_parts").where({ id: req.params.id }).first();
     if (!part) return res.status(404).json({ error: "Peça não encontrada" });
@@ -332,7 +405,7 @@ router.post("/printer-parts/:id/replace", async (req, res) => {
   }
 });
 
-router.delete("/printer-parts/:id", async (req, res) => {
+router.delete("/printer-parts/:id", requireAdmin, async (req, res) => {
   try {
     await db("printer_parts").where({ id: req.params.id }).del();
     res.json({ ok: true });
@@ -343,7 +416,7 @@ router.delete("/printer-parts/:id", async (req, res) => {
 });
 
 // ========== FILAMENTS ==========
-router.get("/filaments", async (req, res) => {
+router.get("/filaments", requireAdmin, async (req, res) => {
   try {
     const filaments = await db("filaments").select("*").orderBy("material");
     res.json(filaments);
@@ -353,7 +426,7 @@ router.get("/filaments", async (req, res) => {
   }
 });
 
-router.post("/filaments", async (req, res) => {
+router.post("/filaments", requireAdmin, async (req, res) => {
   try {
     const { material, color, brand, cost_per_kg, stock_grams } = req.body;
     if (!material || cost_per_kg === undefined) {
@@ -372,7 +445,7 @@ router.post("/filaments", async (req, res) => {
   }
 });
 
-router.put("/filaments/:id", async (req, res) => {
+router.put("/filaments/:id", requireAdmin, async (req, res) => {
   try {
     const { material, color, brand, cost_per_kg, stock_grams } = req.body;
     const fields = {};
@@ -391,7 +464,7 @@ router.put("/filaments/:id", async (req, res) => {
   }
 });
 
-router.delete("/filaments/:id", async (req, res) => {
+router.delete("/filaments/:id", requireAdmin, async (req, res) => {
   try {
     await db("filaments").where({ id: req.params.id }).del();
     res.json({ ok: true });
@@ -402,7 +475,7 @@ router.delete("/filaments/:id", async (req, res) => {
 });
 
 // ========== PRINT PRODUCTS (perfis de impressão) ==========
-router.get("/print-products", async (req, res) => {
+router.get("/print-products", requireAdminOrOperator, async (req, res) => {
   try {
     const products = await db("print_products as pp")
       .leftJoin("filaments as f", "pp.filament_id", "f.id")
@@ -420,7 +493,7 @@ router.get("/print-products", async (req, res) => {
   }
 });
 
-router.post("/print-products", async (req, res) => {
+router.post("/print-products", requireAdmin, async (req, res) => {
   try {
     const {
       name,
@@ -459,7 +532,7 @@ router.post("/print-products", async (req, res) => {
   }
 });
 
-router.put("/print-products/:id", async (req, res) => {
+router.put("/print-products/:id", requireAdmin, async (req, res) => {
   try {
     const {
       name,
@@ -490,7 +563,7 @@ router.put("/print-products/:id", async (req, res) => {
   }
 });
 
-router.delete("/print-products/:id", async (req, res) => {
+router.delete("/print-products/:id", requireAdmin, async (req, res) => {
   try {
     await db("print_products").where({ id: req.params.id }).del();
     res.json({ ok: true });
@@ -501,7 +574,7 @@ router.delete("/print-products/:id", async (req, res) => {
 });
 
 // ========== PRINT JOBS (ciclo de produção) ==========
-router.get("/print-jobs", async (req, res) => {
+router.get("/print-jobs", requireAdmin, async (req, res) => {
   try {
     let query = db("print_jobs as pj")
       .join("printers as pr", "pj.printer_id", "pr.id")
@@ -515,6 +588,14 @@ router.get("/print-jobs", async (req, res) => {
       .orderBy("pj.started_at", "desc");
     if (req.query.status) query = query.where("pj.status", req.query.status);
     if (req.query.printer_id) query = query.where("pj.printer_id", req.query.printer_id);
+    if (req.query.operator_id) {
+      query = query.where(function () {
+        this.where("pj.started_by_operator_id", req.query.operator_id).orWhere(
+          "pj.finished_by_operator_id",
+          req.query.operator_id,
+        );
+      });
+    }
     if (req.query.from) query = query.where("pj.started_at", ">=", req.query.from);
     if (req.query.to) query = query.where("pj.started_at", "<=", req.query.to);
     if (req.query.limit) query = query.limit(parseInt(req.query.limit, 10));
@@ -526,7 +607,38 @@ router.get("/print-jobs", async (req, res) => {
   }
 });
 
-router.post("/print-jobs/start", async (req, res) => {
+// Jobs em andamento/atrasados, com os dados mínimos para o painel operar a frota
+// (não expõe totais de negócio — isso fica em /print-farm/summary, admin-only).
+router.get("/print-farm/active-jobs", requireAdminOrOperator, async (req, res) => {
+  try {
+    const jobs = await db("print_jobs as pj")
+      .join("printers as pr", "pj.printer_id", "pr.id")
+      .join("print_products as pp", "pj.print_product_id", "pp.id")
+      .whereIn("pj.status", ["running", "overdue"])
+      .select(
+        "pj.id",
+        "pj.printer_id",
+        "pj.print_product_id",
+        "pj.planned_units",
+        "pj.started_at",
+        "pj.estimated_end_at",
+        "pj.status",
+        "pj.filament_grams_per_plate_snapshot",
+        "pj.filament_cost_per_kg_snapshot",
+        "pj.unit_sale_price_snapshot",
+        "pj.started_by_operator_name",
+        "pr.number as printer_number",
+        "pr.nickname as printer_nickname",
+        "pp.name as product_name",
+      );
+    res.json(jobs);
+  } catch (e) {
+    console.error("Erro ao listar jobs ativos:", e);
+    res.status(500).json({ error: "Erro ao listar jobs ativos" });
+  }
+});
+
+router.post("/print-jobs/start", requireAdminOrOperator, async (req, res) => {
   try {
     const { printer_id, print_product_id } = req.body;
     if (!printer_id || !print_product_id) {
@@ -571,6 +683,9 @@ router.post("/print-jobs/start", async (req, res) => {
         estimated_end_at: estimatedEndAt,
         status: "running",
         created_by_role: req.user.role,
+        started_by_operator_id: req.user.role === "print_operator" ? req.user.operatorId : null,
+        started_by_operator_name:
+          req.user.role === "print_operator" ? req.user.operatorName : "Admin",
       })
       .returning("id");
 
@@ -586,7 +701,7 @@ router.post("/print-jobs/start", async (req, res) => {
   }
 });
 
-router.post("/print-jobs/:id/finish", async (req, res) => {
+router.post("/print-jobs/:id/finish", requireAdminOrOperator, async (req, res) => {
   try {
     const { success_count, fail_count } = req.body;
     if (success_count === undefined || fail_count === undefined) {
@@ -625,6 +740,9 @@ router.post("/print-jobs/:id/finish", async (req, res) => {
         loss_cost: lossCost,
         revenue_value: revenueValue,
         status: "completed",
+        finished_by_operator_id: req.user.role === "print_operator" ? req.user.operatorId : null,
+        finished_by_operator_name:
+          req.user.role === "print_operator" ? req.user.operatorName : "Admin",
       });
 
     await db("printers")
@@ -648,7 +766,7 @@ router.post("/print-jobs/:id/finish", async (req, res) => {
 });
 
 // ========== MANUTENÇÃO (alertas de desgaste) ==========
-router.get("/print-farm/maintenance-alerts", async (req, res) => {
+router.get("/print-farm/maintenance-alerts", requireAdmin, async (req, res) => {
   try {
     const parts = await db("printer_parts as pp")
       .join("printers as pr", "pp.printer_id", "pr.id")
@@ -675,23 +793,26 @@ router.get("/print-farm/maintenance-alerts", async (req, res) => {
 });
 
 // ========== RELATÓRIOS (perda, custo, lucro) ==========
-router.get("/print-farm/summary", async (req, res) => {
+// Pode ser filtrado por uma impressora específica (?printer_id=) ou trazer a frota inteira.
+router.get("/print-farm/summary", requireAdmin, async (req, res) => {
   try {
     let query = db("print_jobs as pj")
       .join("printers as pr", "pj.printer_id", "pr.id")
       .where("pj.status", "completed");
+    if (req.query.printer_id) query = query.where("pj.printer_id", req.query.printer_id);
     if (req.query.from) query = query.where("pj.finished_at", ">=", req.query.from);
     if (req.query.to) query = query.where("pj.finished_at", "<=", req.query.to);
 
     const jobs = await query.select("pj.*", "pr.number as printer_number", "pr.nickname as printer_nickname");
 
     const byPrinter = {};
+    const byOperator = {};
     let totals = { jobs: 0, success: 0, fail: 0, lossCost: 0, revenue: 0, onTime: 0 };
 
     for (const job of jobs) {
-      const key = job.printer_id;
-      if (!byPrinter[key]) {
-        byPrinter[key] = {
+      const printerKey = job.printer_id;
+      if (!byPrinter[printerKey]) {
+        byPrinter[printerKey] = {
           printer_id: job.printer_id,
           printer_number: job.printer_number,
           printer_nickname: job.printer_nickname,
@@ -703,13 +824,36 @@ router.get("/print-farm/summary", async (req, res) => {
           onTime: 0,
         };
       }
+
+      // Responsável pela chapa: quem finalizou (decide sucesso/falha); se não houver
+      // (finalizado por admin sem conta de operador), cai para quem iniciou.
+      const operatorId = job.finished_by_operator_id ?? job.started_by_operator_id ?? null;
+      const operatorName =
+        job.finished_by_operator_name || job.started_by_operator_name || "Admin";
+      const operatorKey = operatorId !== null ? `op_${operatorId}` : `role_${operatorName}`;
+      if (!byOperator[operatorKey]) {
+        byOperator[operatorKey] = {
+          operator_id: operatorId,
+          operator_name: operatorName,
+          jobs: 0,
+          success: 0,
+          fail: 0,
+          lossCost: 0,
+          revenue: 0,
+          onTime: 0,
+        };
+      }
+
       const onTime = new Date(job.finished_at) <= new Date(job.estimated_end_at);
-      byPrinter[key].jobs += 1;
-      byPrinter[key].success += job.success_count || 0;
-      byPrinter[key].fail += job.fail_count || 0;
-      byPrinter[key].lossCost += Number(job.loss_cost || 0);
-      byPrinter[key].revenue += Number(job.revenue_value || 0);
-      byPrinter[key].onTime += onTime ? 1 : 0;
+
+      for (const bucket of [byPrinter[printerKey], byOperator[operatorKey]]) {
+        bucket.jobs += 1;
+        bucket.success += job.success_count || 0;
+        bucket.fail += job.fail_count || 0;
+        bucket.lossCost += Number(job.loss_cost || 0);
+        bucket.revenue += Number(job.revenue_value || 0);
+        bucket.onTime += onTime ? 1 : 0;
+      }
 
       totals.jobs += 1;
       totals.success += job.success_count || 0;
@@ -719,10 +863,92 @@ router.get("/print-farm/summary", async (req, res) => {
       totals.onTime += onTime ? 1 : 0;
     }
 
-    res.json({ totals, byPrinter: Object.values(byPrinter) });
+    res.json({
+      totals,
+      byPrinter: Object.values(byPrinter),
+      byOperator: Object.values(byOperator),
+    });
   } catch (e) {
     console.error("Erro ao gerar relatório da frota:", e);
     res.status(500).json({ error: "Erro ao gerar relatório da frota" });
+  }
+});
+
+// ========== OPERADORES (funcionários que ligam/desligam impressoras) ==========
+router.get("/print-farm/operators", requireAdmin, async (req, res) => {
+  try {
+    const operators = await db("print_operators")
+      .select("id", "name", "username", "active", "created_at")
+      .orderBy("name");
+    res.json(operators);
+  } catch (e) {
+    console.error("Erro ao listar operadores:", e);
+    res.status(500).json({ error: "Erro ao listar operadores" });
+  }
+});
+
+router.post("/print-farm/operators", requireAdmin, async (req, res) => {
+  try {
+    const { name, username, password } = req.body;
+    if (!name || !username || !password) {
+      return res.status(400).json({ error: "Nome, usuário e senha são obrigatórios" });
+    }
+    if (password.length < 4) {
+      return res.status(400).json({ error: "Senha deve ter pelo menos 4 caracteres" });
+    }
+    const existing = await db("print_operators")
+      .whereRaw("lower(username) = ?", [username.toLowerCase()])
+      .first();
+    if (existing) {
+      return res.status(409).json({ error: "Já existe um operador com esse usuário" });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    const [id] = await db("print_operators")
+      .insert({ name, username, password_hash: passwordHash, active: true })
+      .returning("id");
+    const operator = await db("print_operators")
+      .select("id", "name", "username", "active", "created_at")
+      .where({ id: typeof id === "object" ? id.id : id })
+      .first();
+    res.status(201).json(operator);
+  } catch (e) {
+    console.error("Erro ao criar operador:", e);
+    res.status(500).json({ error: "Erro ao criar operador" });
+  }
+});
+
+router.put("/print-farm/operators/:id", requireAdmin, async (req, res) => {
+  try {
+    const { name, active, password } = req.body;
+    const fields = {};
+    if (name !== undefined) fields.name = name;
+    if (active !== undefined) fields.active = active;
+    if (password) {
+      if (password.length < 4) {
+        return res.status(400).json({ error: "Senha deve ter pelo menos 4 caracteres" });
+      }
+      fields.password_hash = await bcrypt.hash(password, 10);
+    }
+    await db("print_operators").where({ id: req.params.id }).update(fields);
+    const operator = await db("print_operators")
+      .select("id", "name", "username", "active", "created_at")
+      .where({ id: req.params.id })
+      .first();
+    if (!operator) return res.status(404).json({ error: "Operador não encontrado" });
+    res.json(operator);
+  } catch (e) {
+    console.error("Erro ao atualizar operador:", e);
+    res.status(500).json({ error: "Erro ao atualizar operador" });
+  }
+});
+
+router.delete("/print-farm/operators/:id", requireAdmin, async (req, res) => {
+  try {
+    await db("print_operators").where({ id: req.params.id }).del();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Erro ao remover operador:", e);
+    res.status(500).json({ error: "Erro ao remover operador" });
   }
 });
 
