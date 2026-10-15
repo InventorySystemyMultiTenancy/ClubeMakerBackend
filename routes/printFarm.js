@@ -1078,10 +1078,45 @@ router.get("/print-farm/summary", jsonParser, authenticateToken, requireAdmin, a
       totals.onTime += onTime ? 1 : 0;
     }
 
+    // Perdas na entrega de pedidos também são prejuízo, mas não pertencem a uma
+    // impressora — por isso só entram quando o relatório é da frota inteira.
+    let orderLosses = [];
+    if (!req.query.printer_id && (await db.schema.hasTable("order_deliveries"))) {
+      let lossQuery = db("order_deliveries as od")
+        .leftJoin("orders as o", "od.order_id", "o.id")
+        .where("od.lost_units", ">", 0);
+      if (req.query.from) lossQuery = lossQuery.where("od.created_at", ">=", req.query.from);
+      if (req.query.to) lossQuery = lossQuery.where("od.created_at", "<=", req.query.to);
+      const rows = await lossQuery
+        .select("od.*", "o.userName as user_name", "o.externalBuyerName as external_buyer_name")
+        .orderBy("od.created_at", "desc");
+      orderLosses = rows.map((row) => {
+        let items = [];
+        try {
+          items = typeof row.items === "string" ? JSON.parse(row.items) : row.items || [];
+        } catch (e) {
+          items = [];
+        }
+        return {
+          id: row.id,
+          order_id: row.order_id,
+          customer_name: row.user_name || row.external_buyer_name || null,
+          lost_units: Number(row.lost_units) || 0,
+          loss_cost: Number(row.loss_cost) || 0,
+          loss_reason: row.loss_reason || null,
+          items: items.filter((item) => Number(item.lost) > 0),
+          created_at: row.created_at,
+        };
+      });
+    }
+    totals.orderLossUnits = orderLosses.reduce((sum, loss) => sum + loss.lost_units, 0);
+    totals.orderLossCost = orderLosses.reduce((sum, loss) => sum + loss.loss_cost, 0);
+
     res.json({
       totals,
       byPrinter: Object.values(byPrinter),
       byOperator: Object.values(byOperator),
+      orderLosses,
     });
   } catch (e) {
     console.error("Erro ao gerar relatório da frota:", e);
