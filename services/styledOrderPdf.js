@@ -1,13 +1,19 @@
 import PDFDocument from "pdfkit";
 import path from "path";
 import fs from "fs";
+import { fileURLToPath } from "url";
 
 export function generateStyledOrderPdf(order, res) {
   const doc = new PDFDocument({ margin: 40, size: "A4" });
   doc.pipe(res);
 
   // Centralizar logo com espaçamento adequado
-  const logoPath = path.join(process.cwd(), "public", "logo.png");
+  const logoPath = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "public",
+    "clubemaker-logo.png",
+  );
   let y = 40;
   if (fs.existsSync(logoPath)) {
     const logoWidth = 120;
@@ -31,6 +37,13 @@ export function generateStyledOrderPdf(order, res) {
       },
     );
   y += 40;
+
+  // Número do pedido
+  doc
+    .fontSize(14)
+    .font("Helvetica-Bold")
+    .text(`PEDIDO Nº ${order.id}`, 0, y, { align: "center" });
+  y += 30;
 
   // Dados do cliente
   const nomeCliente =
