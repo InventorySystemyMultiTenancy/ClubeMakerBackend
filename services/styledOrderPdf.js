@@ -1,11 +1,8 @@
 import PDFDocument from "pdfkit";
 import path from "path";
 import fs from "fs";
-<<<<<<< HEAD
 import { fileURLToPath } from "url";
-=======
 import axios from "axios";
->>>>>>> e9f0f048bb0cad0e6256445cd933c297e4fbd427
 
 function getFrontendCandidates() {
   const allOrigins = (process.env.FRONTEND_URL || "")
@@ -35,9 +32,15 @@ function getFrontendCandidates() {
 function getLocalLogoCandidates() {
   const customLogoPath = process.env.CLUBEMAKER_LOGO_PATH || process.env.PDF_LOGO_PATH;
   const basePublic = path.join(process.cwd(), "public");
+  const modulePublic = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "public",
+  );
 
   return [
     customLogoPath,
+    path.join(modulePublic, "clubemaker-logo.png"),
     path.join(basePublic, "logo-clubemaker.png"),
     path.join(basePublic, "clubemaker-logo.png"),
     path.join(basePublic, "clubemaker.png"),
@@ -84,16 +87,7 @@ export async function generateStyledOrderPdf(order, res) {
   doc.pipe(res);
 
   // Centralizar logo com espaçamento adequado
-<<<<<<< HEAD
-  const logoPath = path.join(
-    path.dirname(fileURLToPath(import.meta.url)),
-    "..",
-    "public",
-    "clubemaker-logo.png",
-  );
-=======
   const logoSource = await resolveLogoSource();
->>>>>>> e9f0f048bb0cad0e6256445cd933c297e4fbd427
   let y = 40;
   if (logoSource) {
     const logoWidth = 120;
