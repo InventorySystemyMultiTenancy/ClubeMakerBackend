@@ -6,6 +6,7 @@ import knex from "knex";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import path from "path";
+import { isRevokedAdminToken } from "./adminUsers.js";
 
 const router = express.Router();
 
@@ -55,20 +56,26 @@ function authenticateToken(req, res, next) {
   });
 }
 
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
   if (req.user.role !== "admin") {
     return res
       .status(403)
       .json({ error: "Acesso negado. Requer permissão de administrador." });
+  }
+  if (await isRevokedAdminToken(req.user)) {
+    return res.status(401).json({ error: "Acesso de administrador revogado." });
   }
   next();
 }
 
 // Operadores só podem ver a frota/catálogo e iniciar/finalizar produções.
 // Gestão de cadastros (impressoras, peças, filamentos, perfis, operadores) e relatórios são admin-only.
-function requireAdminOrOperator(req, res, next) {
+async function requireAdminOrOperator(req, res, next) {
   if (req.user.role !== "admin" && req.user.role !== "print_operator") {
     return res.status(403).json({ error: "Acesso negado." });
+  }
+  if (await isRevokedAdminToken(req.user)) {
+    return res.status(401).json({ error: "Acesso de administrador revogado." });
   }
   next();
 }

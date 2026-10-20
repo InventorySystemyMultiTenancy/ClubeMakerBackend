@@ -20,6 +20,15 @@ import * as paymentService from "./services/paymentService.js";
 import PDFDocument from "pdfkit";
 import superAdminRoutes from "./routes/superadmin.js";
 import printFarmRoutes, { initPrintFarmTables } from "./routes/printFarm.js";
+import adminUsersRoutes, {
+  initAdminUsersColumns,
+  isRevokedAdminToken,
+} from "./routes/adminUsers.js";
+import adminCustomersRoutes, {
+  initCustomerColumns,
+  parseCustomerPermissions,
+  signCustomerToken,
+} from "./routes/adminCustomers.js";
 import { v2 as cloudinary } from "cloudinary";
 
 // Corrige importação para compatibilidade CommonJS/ESM
@@ -74,6 +83,12 @@ app.use("/api", superAdminRoutes);
 
 // Rotas do módulo de gestão da frota de impressoras 3D
 app.use("/api", printFarmRoutes);
+
+// Cadastro de administradores com acesso por aba
+app.use("/api", adminUsersRoutes);
+
+// Cadastro de clientes pelo admin (aba "Clientes") e funcionalidades liberadas por cliente
+app.use("/api", adminCustomersRoutes);
 
 // Endpoint: contagem de pedidos dos últimos 30 dias
 app.get("/api/orders/last30days-count", async (req, res) => {
@@ -824,6 +839,9 @@ async function initDatabase() {
 
       res.json({
         success: true,
+        // Exigido nas ações do cliente que precisam de identidade confirmada
+        // (ex.: registrar a entrega do próprio pedido)
+        token: signCustomerToken(user),
         user: {
           ...user,
           historico:
@@ -1045,20 +1063,26 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-const authorizeAdmin = (req, res, next) => {
+const authorizeAdmin = async (req, res, next) => {
   if (req.user.role !== "admin") {
     return res
       .status(403)
       .json({ error: "Acesso negado. Requer permissão de administrador." });
   }
+  if (await isRevokedAdminToken(req.user)) {
+    return res.status(401).json({ error: "Acesso de administrador revogado." });
+  }
   next();
 };
 
-const authorizeKitchen = (req, res, next) => {
+const authorizeKitchen = async (req, res, next) => {
   if (req.user.role !== "kitchen" && req.user.role !== "admin") {
     return res.status(403).json({
       error: "Acesso negado. Requer permissão da cozinha ou de administrador.",
     });
+  }
+  if (await isRevokedAdminToken(req.user)) {
+    return res.status(401).json({ error: "Acesso de administrador revogado." });
   }
   next();
 };
@@ -2792,7 +2816,9 @@ app.post("/api/users/check-cpf", async (req, res) => {
     }
     const user = await db("users").where({ cpf: docClean }).first();
     if (user) {
-      return res.json({ exists: true, user });
+      // Rota pública: nunca devolve a senha (de admins/operadores é hash bcrypt)
+      const { password, admin_permissions, ...publicUser } = user;
+      return res.json({ exists: true, user: publicUser });
     } else {
       return res.json({ exists: false, requiresRegistration: true });
     }
@@ -2820,8 +2846,9 @@ app.get("/api/users/cpf/:cpf", async (req, res) => {
       return res.status(404).json({ error: "Usuário não encontrado" });
     }
 
+    const { password, admin_permissions, ...publicUser } = user;
     res.json({
-      ...user,
+      ...publicUser,
       historico: parseJSON(user.historico),
     });
   } catch (e) {
@@ -2988,6 +3015,7 @@ app.post("/api/users/register", async (req, res) => {
 
     res.status(201).json({
       success: true,
+      token: signCustomerToken(newUser),
       user: {
         ...newUser,
         historico: [],
@@ -3270,10 +3298,17 @@ app.get("/api/users/:userId/orders", async (req, res) => {
     const orders = await db("orders")
       .where({ userId })
       .orderBy("timestamp", "desc");
+    const deliveriesByOrder = await getOrderDeliveriesMap(
+      orders.map((o) => o.id),
+    );
     const formattedOrders = await Promise.all(
       orders.map(async (order) => ({
         ...(await attachProjectQuoteToOrder(order)),
         total: parseFloat(order.total),
+        entregueCliente: order.entregueCliente == 1,
+        deliveryStatus:
+          order.deliveryStatus || (order.entregueCliente == 1 ? "delivered" : null),
+        deliveries: deliveriesByOrder[order.id] || [],
       })),
     );
     res.json(formattedOrders);
@@ -3480,169 +3515,226 @@ async function getOrderDeliveriesMap(orderIds) {
 
 // Registra uma entrega. Body: { items: [{ index, delivered, lost }], lossReason?, note? }
 // O que não for entregue nem perdido fica pendente (entrega parcial) e pode ser
-// entregue depois chamando este mesmo endpoint quantas vezes for preciso.
+// entregue depois chamando esta mesma função quantas vezes for preciso.
+// Usada pelo admin/cozinha e pelo próprio cliente (quando liberado pelo admin);
+// assertOrder valida, dentro da transação, se quem chama pode entregar o pedido.
+async function recordOrderDelivery(
+  id,
+  { items: requestedItems, lossReason, note } = {},
+  { role, name },
+  assertOrder = () => {},
+) {
+  if (!Array.isArray(requestedItems) || requestedItems.length === 0) {
+    throw Object.assign(new Error("Informe os itens da entrega."), { status: 400 });
+  }
+
+  return db.transaction(async (trx) => {
+    const order = await trx("orders").where({ id }).first();
+    if (!order) {
+      throw Object.assign(new Error("Pedido não encontrado."), { status: 404 });
+    }
+    assertOrder(order);
+
+    const orderItems = parseJSON(order.items) || [];
+    const previous = (
+      await trx("order_deliveries").where({ order_id: id })
+    ).map(parseOrderDelivery);
+
+    // Pedidos marcados como entregues pelo fluxo antigo não têm registros de entrega
+    if (
+      order.deliveryStatus === "delivered" ||
+      (order.entregueCliente == 1 && previous.length === 0)
+    ) {
+      throw Object.assign(new Error("Pedido já foi totalmente entregue."), {
+        status: 400,
+      });
+    }
+
+    const resolvedByIndex = getDeliveredByItemIndex(previous);
+    const deliveryItems = [];
+    let deliveredUnits = 0;
+    let lostUnits = 0;
+    let lossCost = 0;
+
+    for (const requested of requestedItems) {
+      const index = Number(requested?.index);
+      const orderItem = orderItems[index];
+      if (!Number.isInteger(index) || !orderItem) {
+        throw Object.assign(new Error("Item do pedido inválido."), {
+          status: 400,
+        });
+      }
+
+      const delivered = Math.max(0, parseInt(requested.delivered, 10) || 0);
+      const lost = Math.max(0, parseInt(requested.lost, 10) || 0);
+      if (delivered + lost === 0) continue;
+
+      const remaining = Math.max(
+        0,
+        (Number(orderItem.quantity) || 0) - (resolvedByIndex[index] || 0),
+      );
+      if (delivered + lost > remaining) {
+        throw Object.assign(
+          new Error(
+            `"${orderItem.name}": só restam ${remaining} unidade(s) a entregar.`,
+          ),
+          { status: 400 },
+        );
+      }
+
+      // Perda é valorada pelo custo unitário do produto (priceRaw), assim como
+      // a perda das impressoras é valorada pelo custo do filamento.
+      const productId = orderItem.id || orderItem.productId || null;
+      let unitCost = 0;
+      if (lost > 0 && productId) {
+        const product = await trx("products").where({ id: productId }).first();
+        unitCost = parseFloat(product?.priceRaw) || 0;
+      }
+      const itemLossCost = lost * unitCost;
+
+      resolvedByIndex[index] = (resolvedByIndex[index] || 0) + delivered + lost;
+      deliveredUnits += delivered;
+      lostUnits += lost;
+      lossCost += itemLossCost;
+      deliveryItems.push({
+        index,
+        productId,
+        name: orderItem.name,
+        delivered,
+        lost,
+        unitCost,
+        lossCost: itemLossCost,
+      });
+    }
+
+    if (deliveryItems.length === 0) {
+      throw Object.assign(
+        new Error("Informe ao menos uma unidade entregue ou perdida."),
+        { status: 400 },
+      );
+    }
+
+    // Primeira entrega: desconta o pedido inteiro do estoque, a não ser que o
+    // pagamento já tenha feito isso (mesma regra do mark-paid).
+    const alreadyDeducted =
+      order.paymentStatus === "paid" ||
+      order.paymentStatus === "authorized" ||
+      order.entregueCliente == 1 ||
+      Boolean(order.deliveryStatus);
+    if (!alreadyDeducted) {
+      for (const item of orderItems) {
+        const productId = item?.id || item?.productId;
+        const quantity = Number(item?.quantity) || 0;
+        if (!productId || quantity <= 0) continue;
+        const product = await trx("products").where({ id: productId }).first();
+        if (!product || product.stock === null) continue;
+        await trx("products")
+          .where({ id: productId })
+          .update({
+            stock: Math.max(0, product.stock - quantity),
+            stock_reserved: Math.max(0, (product.stock_reserved || 0) - quantity),
+          });
+        await trx("stock_movements").insert({
+          productId,
+          productName: item.name || "Produto",
+          quantity: -quantity,
+          type: "sale",
+          orderId: id,
+          created_at: new Date(),
+        });
+      }
+    }
+
+    const [inserted] = await trx("order_deliveries")
+      .insert({
+        order_id: id,
+        items: JSON.stringify(deliveryItems),
+        delivered_units: deliveredUnits,
+        lost_units: lostUnits,
+        loss_cost: lossCost,
+        loss_reason: lostUnits > 0 ? lossReason || null : null,
+        note: note || null,
+        created_by_role: role || null,
+        created_by_name: name || role || null,
+      })
+      .returning("id");
+
+    const fullyResolved = orderItems.every(
+      (item, index) =>
+        (resolvedByIndex[index] || 0) >= (Number(item.quantity) || 0),
+    );
+    const deliveryStatus = fullyResolved ? "delivered" : "partial";
+    await trx("orders")
+      .where({ id })
+      .update({ deliveryStatus, entregueCliente: fullyResolved });
+
+    return {
+      deliveryId: typeof inserted === "object" ? inserted.id : inserted,
+      deliveryStatus,
+    };
+  });
+}
+
 app.post(
   "/api/orders/:id/deliveries",
   authenticateToken,
   authorizeKitchen,
   async (req, res) => {
-    const { id } = req.params;
-    const { items: requestedItems, lossReason, note } = req.body || {};
-
-    if (!Array.isArray(requestedItems) || requestedItems.length === 0) {
-      return res.status(400).json({ error: "Informe os itens da entrega." });
-    }
-
     try {
-      const result = await db.transaction(async (trx) => {
-        const order = await trx("orders").where({ id }).first();
-        if (!order) {
-          throw Object.assign(new Error("Pedido não encontrado."), { status: 404 });
-        }
-
-        const orderItems = parseJSON(order.items) || [];
-        const previous = (
-          await trx("order_deliveries").where({ order_id: id })
-        ).map(parseOrderDelivery);
-
-        // Pedidos marcados como entregues pelo fluxo antigo não têm registros de entrega
-        if (
-          order.deliveryStatus === "delivered" ||
-          (order.entregueCliente == 1 && previous.length === 0)
-        ) {
-          throw Object.assign(new Error("Pedido já foi totalmente entregue."), {
-            status: 400,
-          });
-        }
-
-        const resolvedByIndex = getDeliveredByItemIndex(previous);
-        const deliveryItems = [];
-        let deliveredUnits = 0;
-        let lostUnits = 0;
-        let lossCost = 0;
-
-        for (const requested of requestedItems) {
-          const index = Number(requested?.index);
-          const orderItem = orderItems[index];
-          if (!Number.isInteger(index) || !orderItem) {
-            throw Object.assign(new Error("Item do pedido inválido."), {
-              status: 400,
-            });
-          }
-
-          const delivered = Math.max(0, parseInt(requested.delivered, 10) || 0);
-          const lost = Math.max(0, parseInt(requested.lost, 10) || 0);
-          if (delivered + lost === 0) continue;
-
-          const remaining = Math.max(
-            0,
-            (Number(orderItem.quantity) || 0) - (resolvedByIndex[index] || 0),
-          );
-          if (delivered + lost > remaining) {
-            throw Object.assign(
-              new Error(
-                `"${orderItem.name}": só restam ${remaining} unidade(s) a entregar.`,
-              ),
-              { status: 400 },
-            );
-          }
-
-          // Perda é valorada pelo custo unitário do produto (priceRaw), assim como
-          // a perda das impressoras é valorada pelo custo do filamento.
-          const productId = orderItem.id || orderItem.productId || null;
-          let unitCost = 0;
-          if (lost > 0 && productId) {
-            const product = await trx("products").where({ id: productId }).first();
-            unitCost = parseFloat(product?.priceRaw) || 0;
-          }
-          const itemLossCost = lost * unitCost;
-
-          resolvedByIndex[index] = (resolvedByIndex[index] || 0) + delivered + lost;
-          deliveredUnits += delivered;
-          lostUnits += lost;
-          lossCost += itemLossCost;
-          deliveryItems.push({
-            index,
-            productId,
-            name: orderItem.name,
-            delivered,
-            lost,
-            unitCost,
-            lossCost: itemLossCost,
-          });
-        }
-
-        if (deliveryItems.length === 0) {
-          throw Object.assign(
-            new Error("Informe ao menos uma unidade entregue ou perdida."),
-            { status: 400 },
-          );
-        }
-
-        // Primeira entrega: desconta o pedido inteiro do estoque, a não ser que o
-        // pagamento já tenha feito isso (mesma regra do mark-paid).
-        const alreadyDeducted =
-          order.paymentStatus === "paid" ||
-          order.paymentStatus === "authorized" ||
-          order.entregueCliente == 1 ||
-          Boolean(order.deliveryStatus);
-        if (!alreadyDeducted) {
-          for (const item of orderItems) {
-            const productId = item?.id || item?.productId;
-            const quantity = Number(item?.quantity) || 0;
-            if (!productId || quantity <= 0) continue;
-            const product = await trx("products").where({ id: productId }).first();
-            if (!product || product.stock === null) continue;
-            await trx("products")
-              .where({ id: productId })
-              .update({
-                stock: Math.max(0, product.stock - quantity),
-                stock_reserved: Math.max(0, (product.stock_reserved || 0) - quantity),
-              });
-            await trx("stock_movements").insert({
-              productId,
-              productName: item.name || "Produto",
-              quantity: -quantity,
-              type: "sale",
-              orderId: id,
-              created_at: new Date(),
-            });
-          }
-        }
-
-        const [inserted] = await trx("order_deliveries")
-          .insert({
-            order_id: id,
-            items: JSON.stringify(deliveryItems),
-            delivered_units: deliveredUnits,
-            lost_units: lostUnits,
-            loss_cost: lossCost,
-            loss_reason: lostUnits > 0 ? lossReason || null : null,
-            note: note || null,
-            created_by_role: req.user?.role || null,
-            created_by_name: req.user?.name || req.user?.role || null,
-          })
-          .returning("id");
-
-        const fullyResolved = orderItems.every(
-          (item, index) =>
-            (resolvedByIndex[index] || 0) >= (Number(item.quantity) || 0),
-        );
-        const deliveryStatus = fullyResolved ? "delivered" : "partial";
-        await trx("orders")
-          .where({ id })
-          .update({ deliveryStatus, entregueCliente: fullyResolved });
-
-        return {
-          deliveryId: typeof inserted === "object" ? inserted.id : inserted,
-          deliveryStatus,
-        };
+      const result = await recordOrderDelivery(req.params.id, req.body, {
+        role: req.user?.role,
+        name: req.user?.adminName || req.user?.name,
       });
-
       res.json({ success: true, ...result });
     } catch (e) {
       if (e.status) return res.status(e.status).json({ error: e.message });
       console.error("❌ Erro ao registrar entrega do pedido:", e);
+      res.status(500).json({ error: "Erro ao registrar entrega do pedido" });
+    }
+  },
+);
+
+// O próprio cliente registra que recebeu o pedido (mesmo formulário do admin),
+// apenas se o admin liberou a funcionalidade "confirmar_entrega" no cadastro dele.
+app.post(
+  "/api/customer/orders/:id/deliveries",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      if (req.user?.role !== "customer" || !req.user.userId) {
+        return res.status(403).json({ error: "Acesso negado." });
+      }
+      const customer = await db("users").where({ id: req.user.userId }).first();
+      if (
+        !customer ||
+        !parseCustomerPermissions(customer.customer_permissions).includes(
+          "confirmar_entrega",
+        )
+      ) {
+        return res.status(403).json({
+          error: "Seu cadastro não tem permissão para confirmar entregas.",
+        });
+      }
+      const result = await recordOrderDelivery(
+        req.params.id,
+        req.body,
+        { role: "customer", name: customer.name },
+        (order) => {
+          // 404 em vez de 403 para não revelar pedidos de outros clientes
+          if (order.userId !== customer.id) {
+            throw Object.assign(new Error("Pedido não encontrado."), { status: 404 });
+          }
+          if (["canceled", "cancelled"].includes(order.status)) {
+            throw Object.assign(new Error("Pedido cancelado não pode ser entregue."), {
+              status: 400,
+            });
+          }
+        },
+      );
+      res.json({ success: true, ...result });
+    } catch (e) {
+      if (e.status) return res.status(e.status).json({ error: e.message });
+      console.error("❌ Erro ao registrar entrega pelo cliente:", e);
       res.status(500).json({ error: "Erro ao registrar entrega do pedido" });
     }
   },
@@ -6796,7 +6888,13 @@ app.post("/api/point/configure", (req, res) => {
 
 // --- Inicialização ---
 console.log("🚀 Iniciando servidor...");
-Promise.all([initDatabase(), initRedis(), initPrintFarmTables()])
+Promise.all([
+  initDatabase(),
+  initRedis(),
+  initPrintFarmTables(),
+  initAdminUsersColumns(),
+  initCustomerColumns(),
+])
   .then(() => {
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`✅ Servidor rodando na porta ${PORT}`);
