@@ -324,7 +324,7 @@ router.put("/orders/:id/mark-delivered", async (req, res) => {
 
     const updated = await db("orders")
       .where({ id })
-      .update({ entregueCliente: 1 });
+      .update({ entregueCliente: 1, deliveredAt: new Date() });
     if (updated) {
       return res.json({
         success: true,

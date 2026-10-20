@@ -105,21 +105,36 @@ export async function generateStyledOrderPdf(order, res) {
   doc
     .fontSize(18)
     .font("Helvetica-Bold")
-    .text(
-      "ORÇAMENTO (entre em contato para cotar seu frete 11-942058445)",
-      0,
-      y,
-      {
-        align: "center",
-      },
-    );
-  y += 40;
+    .text("ORÇAMENTO", 0, y, { align: "center" });
+  y += 30;
 
-  // Número do pedido
+  // Datas de emissão e entrega
+  const formatDateTime = (value) => {
+    if (!value) return null;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return null;
+    return date.toLocaleString("pt-BR", {
+      timeZone: "America/Sao_Paulo",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
+  const isDelivered =
+    order.entregueCliente == 1 || order.deliveryStatus === "delivered";
+  const emissao = formatDateTime(order.timestamp) || "-";
+  const entrega = isDelivered
+    ? formatDateTime(order.deliveredAt) || "Entregue (data não registrada)"
+    : "Não entregue ainda";
+
   doc
-    .fontSize(14)
-    .font("Helvetica-Bold")
-    .text(`PEDIDO Nº ${order.id}`, 0, y, { align: "center" });
+    .fontSize(11)
+    .font("Helvetica")
+    .text(`Data de emissão: ${emissao}`, 0, y, { align: "center" });
+  y += 16;
+  doc.text(`Data de entrega: ${entrega}`, 0, y, { align: "center" });
   y += 30;
 
   // Dados do cliente

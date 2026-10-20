@@ -708,6 +708,13 @@ async function initDatabase() {
     });
     console.log("✅ Coluna 'deliveryStatus' adicionada à tabela orders");
   }
+  // Data/hora em que o pedido foi totalmente entregue (usada no PDF)
+  if (!(await db.schema.hasColumn("orders", "deliveredAt"))) {
+    await db.schema.table("orders", (table) => {
+      table.timestamp("deliveredAt");
+    });
+    console.log("✅ Coluna 'deliveredAt' adicionada à tabela orders");
+  }
   // Cada linha é um evento de entrega: quanto de cada item foi entregue e quanto
   // foi perda (perda entra como prejuízo, valorada pelo custo unitário do produto).
   if (!(await db.schema.hasTable("order_deliveries"))) {
@@ -761,6 +768,15 @@ async function initDatabase() {
         });
       }
       order.items = items;
+
+      // Pedidos entregues antes da coluna deliveredAt: usa o último registro de entrega
+      if (!order.deliveredAt && order.entregueCliente == 1) {
+        const lastDelivery = await db("order_deliveries")
+          .where({ order_id: order.id })
+          .orderBy("created_at", "desc")
+          .first();
+        if (lastDelivery) order.deliveredAt = lastDelivery.created_at;
+      }
 
       // Buscar dados do usuário
       let user = null;
@@ -3631,7 +3647,11 @@ app.post(
         const deliveryStatus = fullyResolved ? "delivered" : "partial";
         await trx("orders")
           .where({ id })
-          .update({ deliveryStatus, entregueCliente: fullyResolved });
+          .update({
+            deliveryStatus,
+            entregueCliente: fullyResolved,
+            ...(fullyResolved ? { deliveredAt: new Date() } : {}),
+          });
 
         return {
           deliveryId: typeof inserted === "object" ? inserted.id : inserted,
