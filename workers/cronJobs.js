@@ -163,7 +163,36 @@ const expireOrders = cron.schedule("*/10 * * * *", async () => {
   }
 });
 
-// --- CRON JOB 3: Limpar Cache Map em Memória (a cada 1 hora) ---
+// --- CRON JOB 3: Sinalizar Impressões Atrasadas (a cada 1 minuto) ---
+const checkOverduePrintJobs = cron.schedule("*/1 * * * *", async () => {
+  try {
+    const nowIso = new Date().toISOString();
+
+    const overdueJobs = await db("print_jobs")
+      .where({ status: "running" })
+      .where("estimated_end_at", "<", nowIso)
+      .select("id", "printer_id");
+
+    if (overdueJobs.length > 0) {
+      const jobIds = overdueJobs.map((j) => j.id);
+      const printerIds = [...new Set(overdueJobs.map((j) => j.printer_id))];
+
+      await db("print_jobs").whereIn("id", jobIds).update({ status: "overdue" });
+      await db("printers")
+        .whereIn("id", printerIds)
+        .where({ status: "running" })
+        .update({ status: "overdue" });
+
+      console.log(
+        `\n⏰ [WORKER] ${overdueJobs.length} impressão(ões) passaram do prazo previsto e foram marcadas como atrasadas\n`
+      );
+    }
+  } catch (error) {
+    console.error(`   ❌ Erro ao verificar impressões atrasadas: ${error.message}\n`);
+  }
+});
+
+// --- CRON JOB 4: Limpar Cache Map em Memória (a cada 1 hora) ---
 // Nota: Esse job só é necessário se NÃO estiver usando Redis
 const cleanupCache = cron.schedule("0 * * * *", () => {
   // Este job é executado no servidor principal agora, pois precisa acessar o Map
@@ -179,6 +208,7 @@ const shutdown = async (signal) => {
 
   cleanupPointIntents.stop();
   expireOrders.stop();
+  checkOverduePrintJobs.stop();
   cleanupCache.stop();
 
   await db.destroy();
@@ -195,12 +225,14 @@ console.log("🚀 Worker de Cron Jobs iniciado!");
 console.log("📅 Jobs agendados:");
 console.log("   - Limpeza de Payment Intents: a cada 2 minutos");
 console.log("   - Expiração de Pedidos: a cada 10 minutos");
+console.log("   - Impressões 3D atrasadas: a cada 1 minuto");
 console.log("   - Limpeza de Cache: a cada 1 hora (no servidor principal)");
 console.log("\n✅ Aguardando execução dos jobs...\n");
 
 // Inicia os jobs
 cleanupPointIntents.start();
 expireOrders.start();
+checkOverduePrintJobs.start();
 
 // Mantém o processo ativo
 process.on("uncaughtException", (error) => {

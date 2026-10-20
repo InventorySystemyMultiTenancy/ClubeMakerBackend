@@ -19,6 +19,8 @@ import paymentRoutes from "./routes/payment.js";
 import * as paymentService from "./services/paymentService.js";
 import PDFDocument from "pdfkit";
 import superAdminRoutes from "./routes/superadmin.js";
+import printFarmRoutes, { initPrintFarmTables } from "./routes/printFarm.js";
+import { v2 as cloudinary } from "cloudinary";
 
 // Corrige importação para compatibilidade CommonJS/ESM
 // Se der erro, tente:
@@ -28,6 +30,22 @@ import superAdminRoutes from "./routes/superadmin.js";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+if (
+  process.env.CLOUDINARY_CLOUD_NAME &&
+  process.env.CLOUDINARY_API_KEY &&
+  process.env.CLOUDINARY_API_SECRET
+) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+} else {
+  console.warn(
+    "⚠️  Cloudinary não configurado (defina CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY e CLOUDINARY_API_SECRET) — upload de imagens ficará indisponível.",
+  );
+}
 
 const envFrontendOrigins = (process.env.FRONTEND_URL || "")
   .split(",")
@@ -53,6 +71,9 @@ app.use(
 
 // Centraliza as rotas de Super Admin
 app.use("/api", superAdminRoutes);
+
+// Rotas do módulo de gestão da frota de impressoras 3D
+app.use("/api", printFarmRoutes);
 
 // Endpoint: contagem de pedidos dos últimos 30 dias
 app.get("/api/orders/last30days-count", async (req, res) => {
@@ -156,6 +177,36 @@ const parseJSON = (data) => {
 };
 
 // Helper para registrar movimentações de estoque no banco
+const OUTSIDE_ORDER_PAYMENT_METHOD = "pedido_feito_por_fora";
+
+const normalizeOrderText = (value) =>
+  String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const isOutsideOrderPayment = (...values) =>
+  values.some((value) => {
+    const normalized = normalizeOrderText(value);
+    return (
+      normalized === "pedido feito por fora" ||
+      normalized === "pedido por fora" ||
+      normalized === "outside order"
+    );
+  });
+
+const getOutsideBuyerName = (body = {}) =>
+  String(
+    body.externalBuyerName ||
+      body.outsideBuyerName ||
+      body.customerName ||
+      body.buyerName ||
+      "",
+  ).trim();
+
 async function logStockMovement({
   productId,
   productName,
@@ -296,6 +347,11 @@ async function initDatabase() {
     { name: "paymentMethod", type: "string" },
     { name: "installments", type: "integer" },
     { name: "fee", type: "decimal" },
+    { name: "externalBuyerName", type: "string" },
+    { name: "createdByRole", type: "string" },
+    { name: "createdByName", type: "string" },
+    { name: "createdByUserId", type: "string" },
+    { name: "createdByAdmin", type: "boolean" },
   ];
   for (const col of paymentCols) {
     const hasCol = await db.schema.hasColumn("orders", col.name);
@@ -304,6 +360,7 @@ async function initDatabase() {
         if (col.type === "string") table.string(col.name);
         if (col.type === "integer") table.integer(col.name);
         if (col.type === "decimal") table.decimal(col.name, 8, 2);
+        if (col.type === "boolean") table.boolean(col.name).defaultTo(false);
       });
       console.log(`✅ Coluna '${col.name}' adicionada à tabela orders`);
     }
@@ -456,11 +513,22 @@ async function initDatabase() {
       table.string("status").defaultTo("active");
       table.string("paymentStatus").defaultTo("pending");
       table.string("paymentId");
+      table.string("paymentType");
+      table.string("paymentMethod");
+      table.integer("installments");
+      table.decimal("fee", 8, 2);
       table.json("items").notNullable();
+      table.text("observation");
       table.timestamp("completedAt");
       table.boolean("hiddenFromHistory").defaultTo(false);
       table.timestamp("hiddenAt");
       table.string("hiddenBy");
+      table.string("externalBuyerName");
+      table.string("createdByRole");
+      table.string("createdByName");
+      table.string("createdByUserId");
+      table.boolean("createdByAdmin").defaultTo(false);
+      table.timestamp("created_at").defaultTo(db.fn.now());
     });
   }
 
@@ -626,6 +694,39 @@ async function initDatabase() {
     console.log("✅ Tabela 'stock_movements' criada com sucesso");
   }
 
+  // ========== ENTREGAS DE PEDIDOS (total, parcial e perdas) ==========
+  if (!(await db.schema.hasColumn("orders", "entregueCliente"))) {
+    await db.schema.table("orders", (table) => {
+      table.boolean("entregueCliente").defaultTo(false);
+    });
+    console.log("✅ Coluna 'entregueCliente' adicionada à tabela orders");
+  }
+  // null = nada entregue ainda, 'partial' = entrega parcial, 'delivered' = tudo resolvido
+  if (!(await db.schema.hasColumn("orders", "deliveryStatus"))) {
+    await db.schema.table("orders", (table) => {
+      table.string("deliveryStatus");
+    });
+    console.log("✅ Coluna 'deliveryStatus' adicionada à tabela orders");
+  }
+  // Cada linha é um evento de entrega: quanto de cada item foi entregue e quanto
+  // foi perda (perda entra como prejuízo, valorada pelo custo unitário do produto).
+  if (!(await db.schema.hasTable("order_deliveries"))) {
+    await db.schema.createTable("order_deliveries", (table) => {
+      table.increments("id").primary();
+      table.string("order_id").notNullable().index();
+      table.text("items").notNullable(); // JSON: [{ index, productId, name, delivered, lost, unitCost, lossCost }]
+      table.integer("delivered_units").notNullable().defaultTo(0);
+      table.integer("lost_units").notNullable().defaultTo(0);
+      table.decimal("loss_cost", 10, 2).notNullable().defaultTo(0);
+      table.text("loss_reason");
+      table.text("note");
+      table.string("created_by_role");
+      table.string("created_by_name");
+      table.timestamp("created_at").defaultTo(db.fn.now());
+    });
+    console.log("✅ Tabela 'order_deliveries' criada com sucesso");
+  }
+
   // Modo single-tenant: não cria tabela de lojas
   // Configure as credenciais Mercado Pago no .env
   // ...existing code...
@@ -685,7 +786,7 @@ async function initDatabase() {
       );
       const { generateStyledOrderPdf } =
         await import("./services/styledOrderPdf.js");
-      generateStyledOrderPdf(order, res);
+      await generateStyledOrderPdf(order, res);
     } catch (error) {
       console.error("Erro ao gerar PDF do pedido:", error);
       res.status(500).json({ error: "Erro ao gerar PDF do pedido" });
@@ -937,7 +1038,7 @@ const authenticateToken = (req, res, next) => {
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
       console.log(`❌ Token inválido: ${err.message}`);
-      return res.status(403).json({ error: "Token inválido ou expirado." });
+      return res.status(401).json({ error: "Token inválido ou expirado." });
     }
     req.user = user; // Adiciona o payload do token (ex: { role: 'admin' }) à requisição
     next();
@@ -1627,12 +1728,17 @@ app.get(
       };
 
       const normalizePaymentMethod = (method) => {
-        const normalized = String(method || "")
-          .toLowerCase()
-          .trim();
+        const normalized = normalizeOrderText(method);
 
         if (!normalized) {
           return { key: "outros", label: "Outros" };
+        }
+
+        if (isOutsideOrderPayment(normalized)) {
+          return {
+            key: OUTSIDE_ORDER_PAYMENT_METHOD,
+            label: "Pedido feito por fora",
+          };
         }
 
         if (normalized.includes("pix")) {
@@ -2280,6 +2386,36 @@ app.get(
         error: "Erro ao gerar relatório de gestão",
         message: error.message,
       });
+    }
+  },
+);
+
+// Upload de imagem de produto (Admin) — recebe base64 e envia direto ao Cloudinary
+app.post(
+  "/api/admin/upload-image",
+  authenticateToken,
+  authorizeAdmin,
+  async (req, res) => {
+    const { imageBase64 } = req.body;
+
+    if (!imageBase64 || typeof imageBase64 !== "string") {
+      return res.status(400).json({ error: "Imagem não informada" });
+    }
+
+    if (!cloudinary.config().cloud_name) {
+      return res
+        .status(500)
+        .json({ error: "Upload de imagens não configurado no servidor" });
+    }
+
+    try {
+      const result = await cloudinary.uploader.upload(imageBase64, {
+        folder: "clubemaker/products",
+      });
+      res.json({ url: result.secure_url });
+    } catch (e) {
+      console.error("Erro ao enviar imagem para o Cloudinary:", e);
+      res.status(500).json({ error: "Erro ao enviar imagem" });
     }
   },
 );
@@ -2989,17 +3125,56 @@ app.post("/api/orders", async (req, res) => {
     paymentMethod,
     installments,
     fee,
+    externalBuyerName,
+    outsideBuyerName,
+    customerName,
+    buyerName,
+    createdByName,
+    createdByUserId,
+    createdByRole,
+    createdByAdmin,
   } = req.body;
 
   try {
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Pedido precisa ter pelo menos um item" });
+    }
+
+    const outsidePayment = isOutsideOrderPayment(paymentType, paymentMethod);
+    const outsidePaymentBuyerName = getOutsideBuyerName({
+      externalBuyerName,
+      outsideBuyerName,
+      customerName,
+      buyerName,
+    });
+
+    if (outsidePayment && !outsidePaymentBuyerName) {
+      return res.status(400).json({
+        error: "Informe o nome de quem comprou para pedidos feitos por fora",
+      });
+    }
+
+    const effectiveUserName = outsidePayment
+      ? outsidePaymentBuyerName
+      : userName || "Cliente";
+    const effectiveUserId = outsidePayment && !userId ? null : userId;
+    const effectivePaymentType = outsidePayment
+      ? OUTSIDE_ORDER_PAYMENT_METHOD
+      : paymentType || null;
+    const effectivePaymentMethod = outsidePayment
+      ? OUTSIDE_ORDER_PAYMENT_METHOD
+      : paymentMethod || null;
+
     // Iniciamos uma transação para garantir integridade dos dados
     await db.transaction(async (trx) => {
       // 1. Garante que o usuário existe
-      const userExists = await trx("users").where({ id: userId }).first();
-      if (!userExists) {
+      const userExists = effectiveUserId
+        ? await trx("users").where({ id: effectiveUserId }).first()
+        : null;
+      if (effectiveUserId && !userExists) {
         await trx("users").insert({
-          id: userId,
-          name: userName || "Convidado",
+          id: effectiveUserId,
+          name: effectiveUserName || "Convidado",
           email: null,
           cpf: userDoc ? String(userDoc).replace(/\D/g, "") : null, // Salva o CPF/CNPJ aqui!
           historico: "[]",
@@ -3034,19 +3209,24 @@ app.post("/api/orders", async (req, res) => {
 
       const newOrder = {
         id: `order_${Date.now()}`,
-        userId: userId,
-        userName: userName || "Cliente",
+        userId: effectiveUserId,
+        userName: effectiveUserName,
         total: total,
         timestamp: new Date().toISOString(),
         status: "pending",
         paymentStatus: "pending",
         paymentId: paymentId || null,
-        paymentType: paymentType || null,
-        paymentMethod: paymentMethod || null,
+        paymentType: effectivePaymentType,
+        paymentMethod: effectivePaymentMethod,
         items: JSON.stringify(itemsWithPrecoBruto),
         observation: observation || null,
         installments: installments || null,
         fee: fee || null,
+        externalBuyerName: outsidePayment ? outsidePaymentBuyerName : null,
+        createdByRole: createdByRole || (outsidePayment ? "admin" : null),
+        createdByName: createdByName || null,
+        createdByUserId: createdByUserId || null,
+        createdByAdmin: Boolean(createdByAdmin || outsidePayment),
         created_at: new Date(),
       };
 
@@ -3209,9 +3389,10 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
         .json({ error: "Erro ao processar itens do pedido" });
     }
 
-    // Só desconta estoque se ainda não foi descontado via mark-delivered
+    // Só desconta estoque se ainda não foi descontado via entrega (total ou parcial)
     const alreadyDeducted =
       order.entregueCliente == 1 ||
+      Boolean(order.deliveryStatus) ||
       order.paymentStatus === "paid" ||
       order.paymentStatus === "authorized";
     if (!alreadyDeducted) {
@@ -3253,6 +3434,219 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
     res.status(500).json({ error: "Erro ao marcar pedido como pago" });
   }
 });
+
+// ========== ENTREGA DE PEDIDOS (total, parcial e perdas) ==========
+function parseOrderDelivery(row) {
+  return {
+    id: row.id,
+    orderId: row.order_id,
+    items: parseJSON(row.items) || [],
+    deliveredUnits: Number(row.delivered_units) || 0,
+    lostUnits: Number(row.lost_units) || 0,
+    lossCost: parseFloat(row.loss_cost) || 0,
+    lossReason: row.loss_reason || null,
+    note: row.note || null,
+    createdByRole: row.created_by_role || null,
+    createdByName: row.created_by_name || null,
+    createdAt: row.created_at,
+  };
+}
+
+// Quanto de cada item do pedido (por índice) já foi resolvido (entregue ou perdido)
+function getDeliveredByItemIndex(deliveries) {
+  const resolved = {};
+  for (const delivery of deliveries) {
+    for (const item of delivery.items) {
+      resolved[item.index] =
+        (resolved[item.index] || 0) +
+        (Number(item.delivered) || 0) +
+        (Number(item.lost) || 0);
+    }
+  }
+  return resolved;
+}
+
+async function getOrderDeliveriesMap(orderIds) {
+  const map = {};
+  if (orderIds.length === 0) return map;
+  const rows = await db("order_deliveries")
+    .whereIn("order_id", orderIds)
+    .orderBy("created_at", "asc");
+  for (const row of rows) {
+    (map[row.order_id] = map[row.order_id] || []).push(parseOrderDelivery(row));
+  }
+  return map;
+}
+
+// Registra uma entrega. Body: { items: [{ index, delivered, lost }], lossReason?, note? }
+// O que não for entregue nem perdido fica pendente (entrega parcial) e pode ser
+// entregue depois chamando este mesmo endpoint quantas vezes for preciso.
+app.post(
+  "/api/orders/:id/deliveries",
+  authenticateToken,
+  authorizeKitchen,
+  async (req, res) => {
+    const { id } = req.params;
+    const { items: requestedItems, lossReason, note } = req.body || {};
+
+    if (!Array.isArray(requestedItems) || requestedItems.length === 0) {
+      return res.status(400).json({ error: "Informe os itens da entrega." });
+    }
+
+    try {
+      const result = await db.transaction(async (trx) => {
+        const order = await trx("orders").where({ id }).first();
+        if (!order) {
+          throw Object.assign(new Error("Pedido não encontrado."), { status: 404 });
+        }
+
+        const orderItems = parseJSON(order.items) || [];
+        const previous = (
+          await trx("order_deliveries").where({ order_id: id })
+        ).map(parseOrderDelivery);
+
+        // Pedidos marcados como entregues pelo fluxo antigo não têm registros de entrega
+        if (
+          order.deliveryStatus === "delivered" ||
+          (order.entregueCliente == 1 && previous.length === 0)
+        ) {
+          throw Object.assign(new Error("Pedido já foi totalmente entregue."), {
+            status: 400,
+          });
+        }
+
+        const resolvedByIndex = getDeliveredByItemIndex(previous);
+        const deliveryItems = [];
+        let deliveredUnits = 0;
+        let lostUnits = 0;
+        let lossCost = 0;
+
+        for (const requested of requestedItems) {
+          const index = Number(requested?.index);
+          const orderItem = orderItems[index];
+          if (!Number.isInteger(index) || !orderItem) {
+            throw Object.assign(new Error("Item do pedido inválido."), {
+              status: 400,
+            });
+          }
+
+          const delivered = Math.max(0, parseInt(requested.delivered, 10) || 0);
+          const lost = Math.max(0, parseInt(requested.lost, 10) || 0);
+          if (delivered + lost === 0) continue;
+
+          const remaining = Math.max(
+            0,
+            (Number(orderItem.quantity) || 0) - (resolvedByIndex[index] || 0),
+          );
+          if (delivered + lost > remaining) {
+            throw Object.assign(
+              new Error(
+                `"${orderItem.name}": só restam ${remaining} unidade(s) a entregar.`,
+              ),
+              { status: 400 },
+            );
+          }
+
+          // Perda é valorada pelo custo unitário do produto (priceRaw), assim como
+          // a perda das impressoras é valorada pelo custo do filamento.
+          const productId = orderItem.id || orderItem.productId || null;
+          let unitCost = 0;
+          if (lost > 0 && productId) {
+            const product = await trx("products").where({ id: productId }).first();
+            unitCost = parseFloat(product?.priceRaw) || 0;
+          }
+          const itemLossCost = lost * unitCost;
+
+          resolvedByIndex[index] = (resolvedByIndex[index] || 0) + delivered + lost;
+          deliveredUnits += delivered;
+          lostUnits += lost;
+          lossCost += itemLossCost;
+          deliveryItems.push({
+            index,
+            productId,
+            name: orderItem.name,
+            delivered,
+            lost,
+            unitCost,
+            lossCost: itemLossCost,
+          });
+        }
+
+        if (deliveryItems.length === 0) {
+          throw Object.assign(
+            new Error("Informe ao menos uma unidade entregue ou perdida."),
+            { status: 400 },
+          );
+        }
+
+        // Primeira entrega: desconta o pedido inteiro do estoque, a não ser que o
+        // pagamento já tenha feito isso (mesma regra do mark-paid).
+        const alreadyDeducted =
+          order.paymentStatus === "paid" ||
+          order.paymentStatus === "authorized" ||
+          order.entregueCliente == 1 ||
+          Boolean(order.deliveryStatus);
+        if (!alreadyDeducted) {
+          for (const item of orderItems) {
+            const productId = item?.id || item?.productId;
+            const quantity = Number(item?.quantity) || 0;
+            if (!productId || quantity <= 0) continue;
+            const product = await trx("products").where({ id: productId }).first();
+            if (!product || product.stock === null) continue;
+            await trx("products")
+              .where({ id: productId })
+              .update({
+                stock: Math.max(0, product.stock - quantity),
+                stock_reserved: Math.max(0, (product.stock_reserved || 0) - quantity),
+              });
+            await trx("stock_movements").insert({
+              productId,
+              productName: item.name || "Produto",
+              quantity: -quantity,
+              type: "sale",
+              orderId: id,
+              created_at: new Date(),
+            });
+          }
+        }
+
+        const [inserted] = await trx("order_deliveries")
+          .insert({
+            order_id: id,
+            items: JSON.stringify(deliveryItems),
+            delivered_units: deliveredUnits,
+            lost_units: lostUnits,
+            loss_cost: lossCost,
+            loss_reason: lostUnits > 0 ? lossReason || null : null,
+            note: note || null,
+            created_by_role: req.user?.role || null,
+            created_by_name: req.user?.name || req.user?.role || null,
+          })
+          .returning("id");
+
+        const fullyResolved = orderItems.every(
+          (item, index) =>
+            (resolvedByIndex[index] || 0) >= (Number(item.quantity) || 0),
+        );
+        const deliveryStatus = fullyResolved ? "delivered" : "partial";
+        await trx("orders")
+          .where({ id })
+          .update({ deliveryStatus, entregueCliente: fullyResolved });
+
+        return {
+          deliveryId: typeof inserted === "object" ? inserted.id : inserted,
+          deliveryStatus,
+        };
+      });
+
+      res.json({ success: true, ...result });
+    } catch (e) {
+      if (e.status) return res.status(e.status).json({ error: e.message });
+      console.error("❌ Erro ao registrar entrega do pedido:", e);
+      res.status(500).json({ error: "Erro ao registrar entrega do pedido" });
+    }
+  },
+);
 
 app.put("/api/orders/:id", async (req, res) => {
   const { id } = req.params;
@@ -3612,6 +4006,17 @@ app.delete(
             stock_reserved: nextReserved,
           });
 
+          if (shouldRestoreStock) {
+            await trx("stock_movements").insert({
+              productId,
+              productName: item?.name || "Produto",
+              quantity,
+              type: "return",
+              orderId: id,
+              created_at: new Date(),
+            });
+          }
+
           restockedItems.push({
             productId,
             name: item?.name || "Produto",
@@ -3624,6 +4029,7 @@ app.delete(
         }
 
         await trx("order_products").where({ order_id: id }).del();
+        await trx("order_deliveries").where({ order_id: id }).del();
         await trx("orders").where({ id }).del();
       });
 
@@ -3658,7 +4064,10 @@ app.get("/api/orders/history", async (req, res) => {
       .where(function () {
         this.whereIn("paymentStatus", ["paid", "authorized"]).orWhere(
           function () {
-            this.where("paymentType", "presencial");
+            this.whereIn("paymentType", [
+              "presencial",
+              OUTSIDE_ORDER_PAYMENT_METHOD,
+            ]);
           },
         );
       })
@@ -3672,10 +4081,16 @@ app.get("/api/orders/history", async (req, res) => {
     console.log(
       `📋 [GET /api/orders/history] Encontrados ${orders.length} pedidos`,
     );
+    const deliveriesByOrder = await getOrderDeliveriesMap(
+      orders.map((o) => o.id),
+    );
     const parsedOrders = await Promise.all(
       orders.map(async (o) => ({
         ...(await attachProjectQuoteToOrder(o)),
         total: parseFloat(o.total),
+        entregueCliente: o.entregueCliente == 1,
+        deliveryStatus: o.deliveryStatus || (o.entregueCliente == 1 ? "delivered" : null),
+        deliveries: deliveriesByOrder[o.id] || [],
         paymentMethod:
           o.paymentMethod ||
           o.payment_method ||
@@ -6381,7 +6796,7 @@ app.post("/api/point/configure", (req, res) => {
 
 // --- Inicialização ---
 console.log("🚀 Iniciando servidor...");
-Promise.all([initDatabase(), initRedis()])
+Promise.all([initDatabase(), initRedis(), initPrintFarmTables()])
   .then(() => {
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`✅ Servidor rodando na porta ${PORT}`);
