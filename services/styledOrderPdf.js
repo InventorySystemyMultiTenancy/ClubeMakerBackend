@@ -1,6 +1,7 @@
 import PDFDocument from "pdfkit";
 import path from "path";
 import fs from "fs";
+import { fileURLToPath } from "url";
 import axios from "axios";
 
 function getFrontendCandidates() {
@@ -31,9 +32,15 @@ function getFrontendCandidates() {
 function getLocalLogoCandidates() {
   const customLogoPath = process.env.CLUBEMAKER_LOGO_PATH || process.env.PDF_LOGO_PATH;
   const basePublic = path.join(process.cwd(), "public");
+  const modulePublic = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "public",
+  );
 
   return [
     customLogoPath,
+    path.join(modulePublic, "clubemaker-logo.png"),
     path.join(basePublic, "logo-clubemaker.png"),
     path.join(basePublic, "clubemaker-logo.png"),
     path.join(basePublic, "clubemaker.png"),
@@ -98,15 +105,37 @@ export async function generateStyledOrderPdf(order, res) {
   doc
     .fontSize(18)
     .font("Helvetica-Bold")
-    .text(
-      "ORÇAMENTO (entre em contato para cotar seu frete 11-942058445)",
-      0,
-      y,
-      {
-        align: "center",
-      },
-    );
-  y += 40;
+    .text("ORÇAMENTO", 0, y, { align: "center" });
+  y += 30;
+
+  // Datas de emissão e entrega
+  const formatDateTime = (value) => {
+    if (!value) return null;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return null;
+    return date.toLocaleString("pt-BR", {
+      timeZone: "America/Sao_Paulo",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
+  const isDelivered =
+    order.entregueCliente == 1 || order.deliveryStatus === "delivered";
+  const emissao = formatDateTime(order.timestamp) || "-";
+  const entrega = isDelivered
+    ? formatDateTime(order.deliveredAt) || "Entregue (data não registrada)"
+    : "Não entregue ainda";
+
+  doc
+    .fontSize(11)
+    .font("Helvetica")
+    .text(`Data de emissão: ${emissao}`, 0, y, { align: "center" });
+  y += 16;
+  doc.text(`Data de entrega: ${entrega}`, 0, y, { align: "center" });
+  y += 30;
 
   // Dados do cliente
   const nomeCliente =
