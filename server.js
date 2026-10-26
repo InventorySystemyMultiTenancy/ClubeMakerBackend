@@ -748,6 +748,26 @@ async function initDatabase() {
     });
     console.log("✅ Tabela 'order_deliveries' criada com sucesso");
   }
+  // Unidades entregues a mais que o pedido: viram acréscimo no valor do pedido
+  for (const [col, add] of [
+    ["extra_units", (t) => t.integer("extra_units").notNullable().defaultTo(0)],
+    ["extra_amount", (t) => t.decimal("extra_amount", 10, 2).notNullable().defaultTo(0)],
+  ]) {
+    if (!(await db.schema.hasColumn("order_deliveries", col))) {
+      await db.schema.table("order_deliveries", add);
+      console.log(`✅ Coluna '${col}' adicionada à tabela order_deliveries`);
+    }
+  }
+  // extraTotal: soma de todos os acréscimos do pedido (já incluída em total).
+  // extraChargeDue: parte do acréscimo ainda não paga quando o pedido já estava pago.
+  for (const col of ["extraTotal", "extraChargeDue"]) {
+    if (!(await db.schema.hasColumn("orders", col))) {
+      await db.schema.table("orders", (table) => {
+        table.decimal(col, 10, 2).defaultTo(0);
+      });
+      console.log(`✅ Coluna '${col}' adicionada à tabela orders`);
+    }
+  }
 
   // Modo single-tenant: não cria tabela de lojas
   // Configure as credenciais Mercado Pago no .env
@@ -3324,6 +3344,8 @@ app.get("/api/users/:userId/orders", async (req, res) => {
         entregueCliente: order.entregueCliente == 1,
         deliveryStatus:
           order.deliveryStatus || (order.entregueCliente == 1 ? "delivered" : null),
+        extraTotal: parseFloat(order.extraTotal) || 0,
+        extraChargeDue: parseFloat(order.extraChargeDue) || 0,
         deliveries: deliveriesByOrder[order.id] || [],
       })),
     );
@@ -3475,7 +3497,8 @@ app.put("/api/orders/:id/mark-paid", async (req, res) => {
       console.log(`⚠️ [mark-paid] Estoque já descontado. Pulando dedução.`);
     }
 
-    await db("orders").where({ id }).update({ paymentStatus: "paid" });
+    // Pagar o pedido quita também qualquer acréscimo pendente
+    await db("orders").where({ id }).update({ paymentStatus: "paid", extraChargeDue: 0 });
     res.json({
       success: true,
       message: "Pedido marcado como pago e estoque atualizado",
@@ -3496,6 +3519,8 @@ function parseOrderDelivery(row) {
     lostUnits: Number(row.lost_units) || 0,
     lossCost: parseFloat(row.loss_cost) || 0,
     lossReason: row.loss_reason || null,
+    extraUnits: Number(row.extra_units) || 0,
+    extraAmount: parseFloat(row.extra_amount) || 0,
     note: row.note || null,
     createdByRole: row.created_by_role || null,
     createdByName: row.created_by_name || null,
@@ -3529,16 +3554,19 @@ async function getOrderDeliveriesMap(orderIds) {
   return map;
 }
 
-// Registra uma entrega. Body: { items: [{ index, delivered, lost }], lossReason?, note? }
+// Registra uma entrega. Body: { items: [{ index, delivered, lost, extra? }], lossReason?, note? }
 // O que não for entregue nem perdido fica pendente (entrega parcial) e pode ser
 // entregue depois chamando esta mesma função quantas vezes for preciso.
+// extra = unidades entregues além do pedido (só com todo o restante do item entregue):
+// saem do estoque, aumentam a quantidade do item e entram como acréscimo no valor.
 // Usada pelo admin/cozinha e pelo próprio cliente (quando liberado pelo admin);
-// assertOrder valida, dentro da transação, se quem chama pode entregar o pedido.
+// assertOrder valida, dentro da transação, se quem chama pode entregar o pedido, e
+// allowExtra diz se quem chama pode registrar unidades a mais (só a loja).
 async function recordOrderDelivery(
   id,
   { items: requestedItems, lossReason, note } = {},
   { role, name },
-  assertOrder = () => {},
+  { assertOrder = () => {}, allowExtra = false } = {},
 ) {
   if (!Array.isArray(requestedItems) || requestedItems.length === 0) {
     throw Object.assign(new Error("Informe os itens da entrega."), { status: 400 });
@@ -3571,6 +3599,9 @@ async function recordOrderDelivery(
     let deliveredUnits = 0;
     let lostUnits = 0;
     let lossCost = 0;
+    let extraUnits = 0;
+    let extraAmount = 0;
+    const extras = []; // { index, productId, name, extra }
 
     for (const requested of requestedItems) {
       const index = Number(requested?.index);
@@ -3583,7 +3614,14 @@ async function recordOrderDelivery(
 
       const delivered = Math.max(0, parseInt(requested.delivered, 10) || 0);
       const lost = Math.max(0, parseInt(requested.lost, 10) || 0);
-      if (delivered + lost === 0) continue;
+      const extra = Math.max(0, parseInt(requested.extra, 10) || 0);
+      if (extra > 0 && !allowExtra) {
+        throw Object.assign(
+          new Error("Apenas a loja pode registrar unidades entregues a mais."),
+          { status: 403 },
+        );
+      }
+      if (delivered + lost + extra === 0) continue;
 
       const remaining = Math.max(
         0,
@@ -3593,6 +3631,14 @@ async function recordOrderDelivery(
         throw Object.assign(
           new Error(
             `"${orderItem.name}": só restam ${remaining} unidade(s) a entregar.`,
+          ),
+          { status: 400 },
+        );
+      }
+      if (extra > 0 && (delivered !== remaining || lost > 0)) {
+        throw Object.assign(
+          new Error(
+            `"${orderItem.name}": para entregar unidades a mais, entregue antes todo o restante do item.`,
           ),
           { status: 400 },
         );
@@ -3608,18 +3654,29 @@ async function recordOrderDelivery(
       }
       const itemLossCost = lost * unitCost;
 
-      resolvedByIndex[index] = (resolvedByIndex[index] || 0) + delivered + lost;
-      deliveredUnits += delivered;
+      // Acréscimo pelo mesmo preço unitário cobrado no pedido
+      const unitPrice = Number(orderItem.price) || 0;
+      const itemExtraAmount = Number((extra * unitPrice).toFixed(2));
+
+      // "delivered" do registro já inclui as unidades a mais: a quantidade do item
+      // também cresce, então o progresso (entregue + perda >= quantidade) continua valendo
+      resolvedByIndex[index] =
+        (resolvedByIndex[index] || 0) + delivered + extra + lost;
+      deliveredUnits += delivered + extra;
       lostUnits += lost;
       lossCost += itemLossCost;
+      extraUnits += extra;
+      extraAmount += itemExtraAmount;
+      if (extra > 0) extras.push({ index, productId, name: orderItem.name, extra });
       deliveryItems.push({
         index,
         productId,
         name: orderItem.name,
-        delivered,
+        delivered: delivered + extra,
         lost,
         unitCost,
         lossCost: itemLossCost,
+        ...(extra > 0 ? { extra, unitPrice, extraAmount: itemExtraAmount } : {}),
       });
     }
 
@@ -3661,6 +3718,39 @@ async function recordOrderDelivery(
       }
     }
 
+    // Unidades a mais: sempre saem do estoque agora (o desconto acima, do pagamento
+    // ou da primeira entrega, só cobre a quantidade original) e entram no pedido.
+    for (const { index, productId, name: itemName, extra } of extras) {
+      if (productId) {
+        const product = await trx("products").where({ id: productId }).first();
+        if (product && product.stock !== null) {
+          await trx("products")
+            .where({ id: productId })
+            .update({ stock: Math.max(0, product.stock - extra) });
+          await trx("stock_movements").insert({
+            productId,
+            productName: itemName || "Produto",
+            quantity: -extra,
+            type: "sale",
+            orderId: id,
+            created_at: new Date(),
+          });
+        }
+        const row = await trx("order_products")
+          .where({ order_id: id, product_id: productId })
+          .first();
+        if (row) {
+          await trx("order_products")
+            .where({ id: row.id })
+            .update({ quantity: (Number(row.quantity) || 0) + extra });
+        }
+      }
+      const item = orderItems[index];
+      item.quantity = (Number(item.quantity) || 0) + extra;
+      item.extraQuantity = (Number(item.extraQuantity) || 0) + extra;
+    }
+    extraAmount = Number(extraAmount.toFixed(2));
+
     const [inserted] = await trx("order_deliveries")
       .insert({
         order_id: id,
@@ -3668,6 +3758,8 @@ async function recordOrderDelivery(
         delivered_units: deliveredUnits,
         lost_units: lostUnits,
         loss_cost: lossCost,
+        extra_units: extraUnits,
+        extra_amount: extraAmount,
         loss_reason: lostUnits > 0 ? lossReason || null : null,
         note: note || null,
         created_by_role: role || null,
@@ -3680,17 +3772,39 @@ async function recordOrderDelivery(
         (resolvedByIndex[index] || 0) >= (Number(item.quantity) || 0),
     );
     const deliveryStatus = fullyResolved ? "delivered" : "partial";
+
+    // Acréscimo: entra no total do pedido. Se o pedido já estava pago, a diferença
+    // fica em extraChargeDue até ser paga (o pedido não volta a "não pago").
+    const extraFields = {};
+    if (extraAmount > 0) {
+      const alreadyPaid =
+        order.paymentStatus === "paid" || order.paymentStatus === "authorized";
+      extraFields.items = JSON.stringify(orderItems);
+      extraFields.total = Number(((parseFloat(order.total) || 0) + extraAmount).toFixed(2));
+      extraFields.extraTotal = Number(
+        ((parseFloat(order.extraTotal) || 0) + extraAmount).toFixed(2),
+      );
+      if (alreadyPaid) {
+        extraFields.extraChargeDue = Number(
+          ((parseFloat(order.extraChargeDue) || 0) + extraAmount).toFixed(2),
+        );
+      }
+    }
+
     await trx("orders")
       .where({ id })
       .update({
         deliveryStatus,
         entregueCliente: fullyResolved,
         ...(fullyResolved ? { deliveredAt: new Date() } : {}),
+        ...extraFields,
       });
 
     return {
       deliveryId: typeof inserted === "object" ? inserted.id : inserted,
       deliveryStatus,
+      extraUnits,
+      extraAmount,
     };
   });
 }
@@ -3701,10 +3815,12 @@ app.post(
   authorizeKitchen,
   async (req, res) => {
     try {
-      const result = await recordOrderDelivery(req.params.id, req.body, {
-        role: req.user?.role,
-        name: req.user?.adminName || req.user?.name,
-      });
+      const result = await recordOrderDelivery(
+        req.params.id,
+        req.body,
+        { role: req.user?.role, name: req.user?.adminName || req.user?.name },
+        { allowExtra: true },
+      );
       res.json({ success: true, ...result });
     } catch (e) {
       if (e.status) return res.status(e.status).json({ error: e.message });
@@ -3739,16 +3855,18 @@ app.post(
         req.params.id,
         req.body,
         { role: "customer", name: customer.name },
-        (order) => {
-          // 404 em vez de 403 para não revelar pedidos de outros clientes
-          if (order.userId !== customer.id) {
-            throw Object.assign(new Error("Pedido não encontrado."), { status: 404 });
-          }
-          if (["canceled", "cancelled"].includes(order.status)) {
-            throw Object.assign(new Error("Pedido cancelado não pode ser entregue."), {
-              status: 400,
-            });
-          }
+        {
+          assertOrder: (order) => {
+            // 404 em vez de 403 para não revelar pedidos de outros clientes
+            if (order.userId !== customer.id) {
+              throw Object.assign(new Error("Pedido não encontrado."), { status: 404 });
+            }
+            if (["canceled", "cancelled"].includes(order.status)) {
+              throw Object.assign(new Error("Pedido cancelado não pode ser entregue."), {
+                status: 400,
+              });
+            }
+          },
         },
       );
       res.json({ success: true, ...result });
@@ -3756,6 +3874,25 @@ app.post(
       if (e.status) return res.status(e.status).json({ error: e.message });
       console.error("❌ Erro ao registrar entrega pelo cliente:", e);
       res.status(500).json({ error: "Erro ao registrar entrega do pedido" });
+    }
+  },
+);
+
+// Quita o acréscimo (unidades entregues a mais) de um pedido que já estava pago
+app.put(
+  "/api/orders/:id/mark-extra-paid",
+  authenticateToken,
+  authorizeKitchen,
+  async (req, res) => {
+    try {
+      const updated = await db("orders")
+        .where({ id: req.params.id })
+        .update({ extraChargeDue: 0 });
+      if (!updated) return res.status(404).json({ error: "Pedido não encontrado" });
+      res.json({ success: true });
+    } catch (e) {
+      console.error("❌ Erro ao quitar acréscimo do pedido:", e);
+      res.status(500).json({ error: "Erro ao quitar acréscimo do pedido" });
     }
   },
 );
@@ -4202,6 +4339,8 @@ app.get("/api/orders/history", async (req, res) => {
         total: parseFloat(o.total),
         entregueCliente: o.entregueCliente == 1,
         deliveryStatus: o.deliveryStatus || (o.entregueCliente == 1 ? "delivered" : null),
+        extraTotal: parseFloat(o.extraTotal) || 0,
+        extraChargeDue: parseFloat(o.extraChargeDue) || 0,
         deliveries: deliveriesByOrder[o.id] || [],
         paymentMethod:
           o.paymentMethod ||
