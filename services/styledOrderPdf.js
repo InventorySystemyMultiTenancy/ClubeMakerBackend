@@ -85,6 +85,13 @@ async function resolveLogoSource() {
 export async function generateStyledOrderPdf(order, res) {
   const doc = new PDFDocument({ margin: 40, size: "A4" });
   doc.pipe(res);
+  // Observações precisam de ~60pt; abre página nova se o resumo da entrega encheu esta
+  const ensureObservationSpace = () => {
+    if (y + 60 > doc.page.height - 50) {
+      doc.addPage();
+      y = 40;
+    }
+  };
 
   // Centralizar logo com espaçamento adequado
   const logoSource = await resolveLogoSource();
@@ -354,11 +361,107 @@ export async function generateStyledOrderPdf(order, res) {
     .fontSize(13)
     .text("TOTAL:", 250, y)
     .text(
-      `R$ ${(order.total !== undefined ? order.total : order.valor_total || 0).toFixed(2)}`,
+      `R$ ${Number(order.total !== undefined ? order.total : order.valor_total || 0).toFixed(2)}`,
       350,
       y,
     );
-  y += 32;
+  y += 20;
+
+  // Acréscimo por unidades entregues a mais (já incluído no total)
+  const extraTotal = Number(order.extraTotal) || 0;
+  const extraChargeDue = Number(order.extraChargeDue) || 0;
+  if (extraTotal > 0) {
+    doc
+      .font("Helvetica")
+      .fontSize(10)
+      .fillColor("#1d4ed8")
+      .text(`Inclui acréscimo de R$ ${extraTotal.toFixed(2)} por itens entregues a mais`, 250, y);
+    y += 14;
+    if (extraChargeDue > 0) {
+      doc
+        .font("Helvetica-Bold")
+        .text(`Acréscimo a pagar: R$ ${extraChargeDue.toFixed(2)}`, 250, y);
+      y += 14;
+    }
+    doc.fillColor("#000");
+  }
+  y += 12;
+
+  // Resumo da entrega: o que foi entregue, a mais, o que faltou e perdas, por item
+  const summary = order.deliverySummary;
+  if (Array.isArray(summary) && summary.length > 0) {
+    const ensureSpace = (needed) => {
+      if (y + needed > doc.page.height - 50) {
+        doc.addPage();
+        y = 40;
+      }
+    };
+    const totalPending = summary.reduce((sum, row) => sum + row.pending, 0);
+    const totalLost = summary.reduce((sum, row) => sum + row.lost, 0);
+    const totalExtra = summary.reduce((sum, row) => sum + row.extra, 0);
+
+    ensureSpace(80);
+    doc.font("Helvetica-Bold").fontSize(14).fillColor("#000").text("RESUMO DA ENTREGA", 40, y);
+    y += 20;
+    const statusText = isDelivered
+      ? "Entrega concluída"
+      : `Entrega parcial — faltam ${totalPending} unidade(s)`;
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(11)
+      .fillColor(isDelivered ? "#15803d" : "#b45309")
+      .text(statusText, 40, y);
+    doc.fillColor("#000");
+    y += 18;
+
+    const cols = [
+      { label: "Produto", x: 40, width: 190 },
+      { label: "Pedido", x: 235, width: 55 },
+      { label: "Entregue", x: 290, width: 60 },
+      { label: "A mais", x: 355, width: 55 },
+      { label: "Faltou", x: 415, width: 55 },
+      { label: "Perda", x: 475, width: 55 },
+    ];
+    doc.font("Helvetica-Bold").fontSize(10);
+    cols.forEach((col) => doc.text(col.label, col.x, y, { width: col.width }));
+    y += 16;
+
+    summary.forEach((row) => {
+      doc.font("Helvetica").fontSize(10);
+      const nameHeight = doc.heightOfString(row.name, { width: cols[0].width });
+      ensureSpace(nameHeight + 6);
+      const values = [
+        { text: row.name, color: "#000" },
+        { text: String(row.ordered), color: "#000" },
+        { text: String(row.delivered), color: "#000" },
+        { text: row.extra > 0 ? `+${row.extra}` : "-", color: row.extra > 0 ? "#1d4ed8" : "#999" },
+        { text: row.pending > 0 ? String(row.pending) : "-", color: row.pending > 0 ? "#b45309" : "#999" },
+        { text: row.lost > 0 ? String(row.lost) : "-", color: row.lost > 0 ? "#b91c1c" : "#999" },
+      ];
+      values.forEach((value, i) =>
+        doc.fillColor(value.color).text(value.text, cols[i].x, y, { width: cols[i].width }),
+      );
+      doc.fillColor("#000");
+      y += Math.max(nameHeight, 12) + 6;
+    });
+
+    const totalsLine = [
+      totalExtra > 0 ? `${totalExtra} un. a mais` : null,
+      totalPending > 0 ? `${totalPending} un. faltando` : null,
+      totalLost > 0 ? `${totalLost} un. de perda` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    if (totalsLine) {
+      ensureSpace(20);
+      doc.font("Helvetica").fontSize(9).fillColor("#666").text(`Total: ${totalsLine}`, 40, y);
+      doc.fillColor("#000");
+      y += 16;
+    }
+    y += 12;
+  }
+
+  ensureObservationSpace();
 
   // Observações
   doc

@@ -802,6 +802,13 @@ async function initDatabase() {
           discountPercent: op.discountPercent,
         });
       }
+      // Resumo da entrega por item (pedido, entregue, a mais, faltou, perda) para o PDF.
+      // Usa os itens do JSON do pedido (índices das entregas e unidades a mais), antes
+      // de order.items ser trocado pelas linhas de order_products.
+      const deliveries = (
+        await db("order_deliveries").where({ order_id: order.id }).orderBy("created_at", "asc")
+      ).map(parseOrderDelivery);
+      order.deliverySummary = getOrderDeliverySummary(parseJSON(order.items) || [], deliveries);
       order.items = items;
 
       // Pedidos entregues antes da coluna deliveredAt: usa o último registro de entrega
@@ -3526,6 +3533,34 @@ function parseOrderDelivery(row) {
     createdByName: row.created_by_name || null,
     createdAt: row.created_at,
   };
+}
+
+// Situação de cada item do pedido somando todas as entregas: quanto foi pedido
+// (sem as unidades a mais), entregue (com as a mais), a mais, perdido e o que falta.
+// null quando o pedido não tem registros de entrega.
+function getOrderDeliverySummary(orderItems, deliveries) {
+  if (!deliveries.length) return null;
+  const byIndex = {};
+  for (const delivery of deliveries) {
+    for (const item of delivery.items) {
+      const acc = (byIndex[item.index] = byIndex[item.index] || { delivered: 0, lost: 0 });
+      acc.delivered += Number(item.delivered) || 0;
+      acc.lost += Number(item.lost) || 0;
+    }
+  }
+  return orderItems.map((item, index) => {
+    const quantity = Number(item.quantity) || 0;
+    const extra = Number(item.extraQuantity) || 0;
+    const { delivered = 0, lost = 0 } = byIndex[index] || {};
+    return {
+      name: item.name || "Produto",
+      ordered: quantity - extra,
+      delivered,
+      extra,
+      lost,
+      pending: Math.max(0, quantity - delivered - lost),
+    };
+  });
 }
 
 // Quanto de cada item do pedido (por índice) já foi resolvido (entregue ou perdido)
