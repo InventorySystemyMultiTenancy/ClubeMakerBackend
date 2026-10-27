@@ -295,8 +295,11 @@ export async function generateStyledOrderPdf(order, res) {
     .text("Valor Unit.", 250, y)
     .text("Subtotal", 350, y);
   y += 18;
-  // Exibe produtos comprados
-  (order.items || []).forEach((item) => {
+  // Exibe produtos comprados. Pedido finalizado na entrega cobra só o que foi
+  // entregue: item que não teve nenhuma unidade entregue fica fora da lista.
+  (order.items || [])
+    .filter((item) => item.quantity === undefined || item.quantity === null || Number(item.quantity) > 0)
+    .forEach((item) => {
     const nome =
       item.name ||
       item.produto ||
@@ -404,7 +407,7 @@ export async function generateStyledOrderPdf(order, res) {
     doc.font("Helvetica-Bold").fontSize(14).fillColor("#000").text("RESUMO DA ENTREGA", 40, y);
     y += 20;
     const statusText = isDelivered
-      ? "Entrega concluída"
+      ? "Pedido finalizado na entrega — valores apenas dos itens entregues"
       : `Entrega parcial — faltam ${totalPending} unidade(s)`;
     doc
       .font("Helvetica-Bold")
@@ -419,7 +422,7 @@ export async function generateStyledOrderPdf(order, res) {
       { label: "Pedido", x: 235, width: 55 },
       { label: "Entregue", x: 290, width: 60 },
       { label: "A mais", x: 355, width: 55 },
-      { label: "Faltou", x: 415, width: 55 },
+      { label: isDelivered ? "Não entr." : "Faltou", x: 415, width: 55 },
       { label: "Perda", x: 475, width: 55 },
     ];
     doc.font("Helvetica-Bold").fontSize(10);
@@ -447,7 +450,9 @@ export async function generateStyledOrderPdf(order, res) {
 
     const totalsLine = [
       totalExtra > 0 ? `${totalExtra} un. a mais` : null,
-      totalPending > 0 ? `${totalPending} un. faltando` : null,
+      totalPending > 0
+        ? `${totalPending} un. ${isDelivered ? "não entregue(s)" : "faltando"}`
+        : null,
       totalLost > 0 ? `${totalLost} un. de perda` : null,
     ]
       .filter(Boolean)

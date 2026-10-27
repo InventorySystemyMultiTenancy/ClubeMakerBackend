@@ -760,7 +760,8 @@ async function initDatabase() {
   }
   // extraTotal: soma de todos os acréscimos do pedido (já incluída em total).
   // extraChargeDue: parte do acréscimo ainda não paga quando o pedido já estava pago.
-  for (const col of ["extraTotal", "extraChargeDue"]) {
+  // refundDue: valor a devolver quando o pedido já pago foi finalizado com menos itens.
+  for (const col of ["extraTotal", "extraChargeDue", "refundDue"]) {
     if (!(await db.schema.hasColumn("orders", col))) {
       await db.schema.table("orders", (table) => {
         table.decimal(col, 10, 2).defaultTo(0);
@@ -3353,6 +3354,7 @@ app.get("/api/users/:userId/orders", async (req, res) => {
           order.deliveryStatus || (order.entregueCliente == 1 ? "delivered" : null),
         extraTotal: parseFloat(order.extraTotal) || 0,
         extraChargeDue: parseFloat(order.extraChargeDue) || 0,
+        refundDue: parseFloat(order.refundDue) || 0,
         deliveries: deliveriesByOrder[order.id] || [],
       })),
     );
@@ -3551,14 +3553,20 @@ function getOrderDeliverySummary(orderItems, deliveries) {
   return orderItems.map((item, index) => {
     const quantity = Number(item.quantity) || 0;
     const extra = Number(item.extraQuantity) || 0;
+    // orderedQuantity é gravado na finalização; antes dela, pedido = quantidade - a mais
+    const ordered =
+      item.orderedQuantity !== undefined && item.orderedQuantity !== null
+        ? Number(item.orderedQuantity) || 0
+        : quantity - extra;
     const { delivered = 0, lost = 0 } = byIndex[index] || {};
     return {
       name: item.name || "Produto",
-      ordered: quantity - extra,
+      ordered,
       delivered,
       extra,
       lost,
-      pending: Math.max(0, quantity - delivered - lost),
+      // Não entregue: no pedido finalizado saiu do pedido; no parcial antigo, ainda pendente
+      pending: Math.max(0, ordered + extra - delivered - lost),
     };
   });
 }
@@ -3589,11 +3597,12 @@ async function getOrderDeliveriesMap(orderIds) {
   return map;
 }
 
-// Registra uma entrega. Body: { items: [{ index, delivered, lost, extra? }], lossReason?, note? }
-// O que não for entregue nem perdido fica pendente (entrega parcial) e pode ser
-// entregue depois chamando esta mesma função quantas vezes for preciso.
+// Registra a entrega e FINALIZA o pedido. Body: { items: [{ index, delivered, lost, extra? }], lossReason?, note? }
+// O pedido passa a cobrar só o que foi entregue: o que não foi entregue nem perdido
+// sai do pedido e volta ao estoque; perdas ficam baixadas (prejuízo) e não são cobradas.
 // extra = unidades entregues além do pedido (só com todo o restante do item entregue):
-// saem do estoque, aumentam a quantidade do item e entram como acréscimo no valor.
+// saem do estoque e entram como acréscimo no valor.
+// Pedidos que ficaram em entrega parcial no fluxo antigo são finalizados na próxima entrega.
 // Usada pelo admin/cozinha e pelo próprio cliente (quando liberado pelo admin);
 // assertOrder valida, dentro da transação, se quem chama pode entregar o pedido, e
 // allowExtra diz se quem chama pode registrar unidades a mais (só a loja).
@@ -3753,36 +3762,96 @@ async function recordOrderDelivery(
       }
     }
 
-    // Unidades a mais: sempre saem do estoque agora (o desconto acima, do pagamento
-    // ou da primeira entrega, só cobre a quantidade original) e entram no pedido.
-    for (const { index, productId, name: itemName, extra } of extras) {
-      if (productId) {
-        const product = await trx("products").where({ id: productId }).first();
-        if (product && product.stock !== null) {
-          await trx("products")
-            .where({ id: productId })
-            .update({ stock: Math.max(0, product.stock - extra) });
-          await trx("stock_movements").insert({
-            productId,
-            productName: itemName || "Produto",
-            quantity: -extra,
-            type: "sale",
-            orderId: id,
-            created_at: new Date(),
-          });
-        }
-        const row = await trx("order_products")
-          .where({ order_id: id, product_id: productId })
-          .first();
-        if (row) {
-          await trx("order_products")
-            .where({ id: row.id })
-            .update({ quantity: (Number(row.quantity) || 0) + extra });
-        }
+    // ===== Finalização: toda entrega encerra o pedido com o que foi entregue =====
+    const extraByIndex = {};
+    for (const { index, extra } of extras) extraByIndex[index] = extra;
+
+    // Entregue (já com as unidades a mais) e perdido por item, nesta e nas entregas anteriores
+    const deliveredByIndex = {};
+    const lostByIndex = {};
+    for (const item of [...previous.flatMap((d) => d.items), ...deliveryItems]) {
+      deliveredByIndex[item.index] =
+        (deliveredByIndex[item.index] || 0) + (Number(item.delivered) || 0);
+      lostByIndex[item.index] = (lostByIndex[item.index] || 0) + (Number(item.lost) || 0);
+    }
+
+    // Unidades por produto: a mais saem do estoque; não entregues (nem perdidas) voltam,
+    // pois o pedido inteiro já tinha sido descontado (no pagamento ou acima).
+    const stockChanges = {}; // productId -> { name, extra, returned }
+    let totalDelta = 0;
+    orderItems.forEach((item, index) => {
+      const quantityBefore = Number(item.quantity) || 0;
+      const extraNow = extraByIndex[index] || 0;
+      const delivered = deliveredByIndex[index] || 0;
+      const lost = lostByIndex[index] || 0;
+      const notDelivered = Math.max(0, quantityBefore + extraNow - delivered - lost);
+
+      // Quantidade pedida original, guardada uma vez para o resumo da entrega e o PDF
+      if (item.orderedQuantity === undefined || item.orderedQuantity === null) {
+        item.orderedQuantity = quantityBefore - (Number(item.extraQuantity) || 0);
       }
-      const item = orderItems[index];
-      item.quantity = (Number(item.quantity) || 0) + extra;
-      item.extraQuantity = (Number(item.extraQuantity) || 0) + extra;
+      if (extraNow > 0) item.extraQuantity = (Number(item.extraQuantity) || 0) + extraNow;
+      // Passa a cobrar só o que foi entregue
+      item.quantity = delivered;
+      totalDelta += (delivered - quantityBefore) * (Number(item.price) || 0);
+
+      const productId = item.id || item.productId;
+      if (productId && (extraNow > 0 || notDelivered > 0)) {
+        const change = (stockChanges[productId] = stockChanges[productId] || {
+          name: item.name,
+          extra: 0,
+          returned: 0,
+        });
+        change.extra += extraNow;
+        change.returned += notDelivered;
+      }
+    });
+
+    for (const [productId, change] of Object.entries(stockChanges)) {
+      const product = await trx("products").where({ id: productId }).first();
+      if (!product || product.stock === null) continue;
+      await trx("products")
+        .where({ id: productId })
+        .update({ stock: Math.max(0, product.stock - change.extra + change.returned) });
+      if (change.extra > 0) {
+        await trx("stock_movements").insert({
+          productId,
+          productName: change.name || "Produto",
+          quantity: -change.extra,
+          type: "sale",
+          orderId: id,
+          created_at: new Date(),
+        });
+      }
+      if (change.returned > 0) {
+        await trx("stock_movements").insert({
+          productId,
+          productName: change.name || "Produto",
+          quantity: change.returned,
+          type: "return",
+          orderId: id,
+          created_at: new Date(),
+        });
+      }
+    }
+
+    // order_products (usado no PDF) acompanha as quantidades entregues
+    const quantityByProduct = {};
+    for (const item of orderItems) {
+      const productId = item.id || item.productId;
+      if (productId) {
+        quantityByProduct[productId] = (quantityByProduct[productId] || 0) + item.quantity;
+      }
+    }
+    for (const [productId, quantity] of Object.entries(quantityByProduct)) {
+      const rows = await trx("order_products")
+        .where({ order_id: id, product_id: productId })
+        .orderBy("id");
+      for (const [i, row] of rows.entries()) {
+        await trx("order_products")
+          .where({ id: row.id })
+          .update({ quantity: i === 0 ? quantity : 0 });
+      }
     }
     extraAmount = Number(extraAmount.toFixed(2));
 
@@ -3802,37 +3871,32 @@ async function recordOrderDelivery(
       })
       .returning("id");
 
-    const fullyResolved = orderItems.every(
-      (item, index) =>
-        (resolvedByIndex[index] || 0) >= (Number(item.quantity) || 0),
-    );
-    const deliveryStatus = fullyResolved ? "delivered" : "partial";
-
-    // Acréscimo: entra no total do pedido. Se o pedido já estava pago, a diferença
-    // fica em extraChargeDue até ser paga (o pedido não volta a "não pago").
-    const extraFields = {};
-    if (extraAmount > 0) {
-      const alreadyPaid =
-        order.paymentStatus === "paid" || order.paymentStatus === "authorized";
-      extraFields.items = JSON.stringify(orderItems);
-      extraFields.total = Number(((parseFloat(order.total) || 0) + extraAmount).toFixed(2));
-      extraFields.extraTotal = Number(
-        ((parseFloat(order.extraTotal) || 0) + extraAmount).toFixed(2),
+    // Novo total pela diferença (preserva taxas/ajustes que já estavam no total).
+    // Pedido já pago: a diferença vira acréscimo a pagar ou valor a devolver.
+    const previousTotal = parseFloat(order.total) || 0;
+    const total = Math.max(0, Number((previousTotal + totalDelta).toFixed(2)));
+    const balance = Number((total - previousTotal).toFixed(2));
+    const alreadyPaid = order.paymentStatus === "paid" || order.paymentStatus === "authorized";
+    const paymentFields = {};
+    if (alreadyPaid && balance > 0) {
+      paymentFields.extraChargeDue = Number(
+        ((parseFloat(order.extraChargeDue) || 0) + balance).toFixed(2),
       );
-      if (alreadyPaid) {
-        extraFields.extraChargeDue = Number(
-          ((parseFloat(order.extraChargeDue) || 0) + extraAmount).toFixed(2),
-        );
-      }
+    } else if (alreadyPaid && balance < 0) {
+      paymentFields.refundDue = Number(((parseFloat(order.refundDue) || 0) - balance).toFixed(2));
     }
 
+    const deliveryStatus = "delivered";
     await trx("orders")
       .where({ id })
       .update({
         deliveryStatus,
-        entregueCliente: fullyResolved,
-        ...(fullyResolved ? { deliveredAt: new Date() } : {}),
-        ...extraFields,
+        entregueCliente: true,
+        deliveredAt: new Date(),
+        items: JSON.stringify(orderItems),
+        total,
+        extraTotal: Number(((parseFloat(order.extraTotal) || 0) + extraAmount).toFixed(2)),
+        ...paymentFields,
       });
 
     return {
@@ -3840,6 +3904,9 @@ async function recordOrderDelivery(
       deliveryStatus,
       extraUnits,
       extraAmount,
+      previousTotal,
+      total,
+      refundDue: paymentFields.refundDue || 0,
     };
   });
 }
@@ -3913,6 +3980,23 @@ app.post(
   },
 );
 
+// Registra que o valor a devolver (pedido pago finalizado com menos itens) foi devolvido
+app.put(
+  "/api/orders/:id/mark-refunded",
+  authenticateToken,
+  authorizeKitchen,
+  async (req, res) => {
+    try {
+      const updated = await db("orders").where({ id: req.params.id }).update({ refundDue: 0 });
+      if (!updated) return res.status(404).json({ error: "Pedido não encontrado" });
+      res.json({ success: true });
+    } catch (e) {
+      console.error("❌ Erro ao registrar devolução do pedido:", e);
+      res.status(500).json({ error: "Erro ao registrar devolução do pedido" });
+    }
+  },
+);
+
 // Quita o acréscimo (unidades entregues a mais) de um pedido que já estava pago
 app.put(
   "/api/orders/:id/mark-extra-paid",
@@ -3968,6 +4052,12 @@ app.put("/api/orders/:id", async (req, res) => {
     if (paymentStatus) updates.paymentStatus = paymentStatus;
 
     if (items !== undefined) {
+      // A entrega finaliza o pedido com os itens entregues: não dá mais para editar
+      if (order.deliveryStatus === "delivered" || order.entregueCliente == 1) {
+        return res
+          .status(400)
+          .json({ error: "Pedido já entregue e finalizado: os itens não podem mais ser editados." });
+      }
       if (!Array.isArray(items) || items.length === 0) {
         return res
           .status(400)
@@ -4376,6 +4466,7 @@ app.get("/api/orders/history", async (req, res) => {
         deliveryStatus: o.deliveryStatus || (o.entregueCliente == 1 ? "delivered" : null),
         extraTotal: parseFloat(o.extraTotal) || 0,
         extraChargeDue: parseFloat(o.extraChargeDue) || 0,
+        refundDue: parseFloat(o.refundDue) || 0,
         deliveries: deliveriesByOrder[o.id] || [],
         paymentMethod:
           o.paymentMethod ||
