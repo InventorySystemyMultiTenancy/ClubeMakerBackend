@@ -810,6 +810,15 @@ async function initDatabase() {
         await db("order_deliveries").where({ order_id: order.id }).orderBy("created_at", "asc")
       ).map(parseOrderDelivery);
       order.deliverySummary = getOrderDeliverySummary(parseJSON(order.items) || [], deliveries);
+      // Observações e motivos de perda digitados ao registrar cada entrega
+      order.deliveryNotes = deliveries
+        .filter((d) => d.note || d.lossReason)
+        .map((d) => ({
+          note: d.note,
+          lossReason: d.lossReason,
+          createdByName: d.createdByName,
+          createdAt: d.createdAt,
+        }));
       order.items = items;
 
       // Pedidos entregues antes da coluna deliveredAt: usa o último registro de entrega
@@ -3533,7 +3542,11 @@ function parseOrderDelivery(row) {
     note: row.note || null,
     createdByRole: row.created_by_role || null,
     createdByName: row.created_by_name || null,
-    createdAt: row.created_at,
+    // SQLite devolve "AAAA-MM-DD HH:MM:SS" em UTC sem fuso; o pg já devolve Date
+    createdAt:
+      typeof row.created_at === "string" && !/[zZ]|[+-]\d\d:?\d\d$/.test(row.created_at)
+        ? `${row.created_at.replace(" ", "T")}Z`
+        : row.created_at,
   };
 }
 

@@ -466,6 +466,43 @@ export async function generateStyledOrderPdf(order, res) {
     y += 12;
   }
 
+  // Observações da entrega (e motivo da perda) registradas por quem entregou
+  const deliveryNotes = Array.isArray(order.deliveryNotes) ? order.deliveryNotes : [];
+  if (deliveryNotes.length > 0) {
+    ensureObservationSpace();
+    doc.font("Helvetica-Bold").fontSize(12).fillColor("#000").text("OBSERVAÇÕES DA ENTREGA", 40, y);
+    y += 18;
+    deliveryNotes.forEach((entry) => {
+      const date = entry.createdAt ? new Date(entry.createdAt) : null;
+      const header = [
+        date && !Number.isNaN(date.getTime())
+          ? date.toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" })
+          : null,
+        entry.createdByName,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      const lines = [
+        entry.lossReason ? `Motivo da perda: ${entry.lossReason}` : null,
+        entry.note ? `Observação: ${entry.note}` : null,
+      ].filter(Boolean);
+      doc.font("Helvetica").fontSize(10);
+      const body = lines.join("\n");
+      const needed = (header ? 14 : 0) + doc.heightOfString(body, { width: 500 }) + 8;
+      if (y + needed > doc.page.height - 50) {
+        doc.addPage();
+        y = 40;
+      }
+      if (header) {
+        doc.fontSize(9).fillColor("#666").text(header, 40, y, { width: 500 });
+        y += 14;
+      }
+      doc.fontSize(10).fillColor("#000").text(body, 40, y, { width: 500 });
+      y += doc.heightOfString(body, { width: 500 }) + 8;
+    });
+    y += 8;
+  }
+
   ensureObservationSpace();
 
   // Observações
