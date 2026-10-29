@@ -4462,8 +4462,15 @@ app.get("/api/orders/history", async (req, res) => {
         this.where("hiddenFromHistory", false).orWhereNull("hiddenFromHistory");
       })
       .orderBy("timestamp", "desc");
-    if (start) query = query.where("timestamp", ">=", start);
-    if (end) query = query.where("timestamp", "<=", end);
+    // Datas puras (AAAA-MM-DD) valem o dia inteiro no horário de Brasília;
+    // timestamp é ISO em UTC, então "<= 2026-10-29" sozinho excluiria o próprio dia.
+    const isDateOnly = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value);
+    const startAt =
+      start && isDateOnly(start) ? new Date(`${start}T00:00:00-03:00`).toISOString() : start;
+    const endAt =
+      end && isDateOnly(end) ? new Date(`${end}T23:59:59.999-03:00`).toISOString() : end;
+    if (startAt) query = query.where("timestamp", ">=", startAt);
+    if (endAt) query = query.where("timestamp", "<=", endAt);
     const orders = await query;
     console.log(
       `📋 [GET /api/orders/history] Encontrados ${orders.length} pedidos`,
@@ -4471,6 +4478,28 @@ app.get("/api/orders/history", async (req, res) => {
     const deliveriesByOrder = await getOrderDeliveriesMap(
       orders.map((o) => o.id),
     );
+    // Custo do pedido (para o valor líquido): custo unitário (priceRaw) × quantidade
+    // de cada item, com o custo gravado no item quando houver, mais as perdas na entrega.
+    const unitCostByProduct = new Map(
+      (await db("products").select("id", "priceRaw")).map((p) => [
+        String(p.id),
+        parseFloat(p.priceRaw) || 0,
+      ]),
+    );
+    const getOrderCost = (order, deliveries) => {
+      const items = parseJSON(order.items);
+      const itemsCost = (Array.isArray(items) ? items : []).reduce((sum, item) => {
+        const snapshotCost = Number(item.precoBruto ?? item.priceRaw);
+        const unitCost =
+          Number.isFinite(snapshotCost) && snapshotCost > 0
+            ? snapshotCost
+            : unitCostByProduct.get(String(item.productId || item.id)) || 0;
+        const quantity = item.quantity === undefined || item.quantity === null ? 1 : Number(item.quantity) || 0;
+        return sum + unitCost * quantity;
+      }, 0);
+      const lossCost = deliveries.reduce((sum, d) => sum + (d.lossCost || 0), 0);
+      return Number((itemsCost + lossCost).toFixed(2));
+    };
     const parsedOrders = await Promise.all(
       orders.map(async (o) => ({
         ...(await attachProjectQuoteToOrder(o)),
@@ -4481,6 +4510,7 @@ app.get("/api/orders/history", async (req, res) => {
         extraChargeDue: parseFloat(o.extraChargeDue) || 0,
         refundDue: parseFloat(o.refundDue) || 0,
         deliveries: deliveriesByOrder[o.id] || [],
+        cost: getOrderCost(o, deliveriesByOrder[o.id] || []),
         paymentMethod:
           o.paymentMethod ||
           o.payment_method ||
